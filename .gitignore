@@ -1,32 +1,21 @@
-# Prerequisites
-*.d
+# Virtual environment
+.venv/
+env/
+venv/
 
-# Compiled Object files
-*.slo
-*.lo
-*.o
-*.obj
+# uv lock file (for library projects, or if you prefer to regenerate)
+# uv.lock
 
-# Precompiled Headers
-*.gch
-*.pch
+# Build artifacts
+dist/
+build/
+*.egg-info/
 
-# Compiled Dynamic libraries
-*.so
-*.dylib
-*.dll
+# Cache files
+__pycache__/
+.pytest_cache/
+.mypy_cache/
 
-# Fortran module files
-*.mod
-*.smod
-
-# Compiled Static libraries
-*.lai
-*.la
-*.a
-*.lib
-
-# Executables
-*.exe
-*.out
-*.app
+# Editor/OS specific files
+.DS_Store
+*.swp
