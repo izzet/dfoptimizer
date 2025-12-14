@@ -1,0 +1,29 @@
+{
+  "map_parallel_calls": {
+    "type": "int",
+    "values": [
+      1,
+      2,
+      4,
+      8
+    ]
+  },
+  "prefetch_buffer": {
+    "type": "int",
+    "values": [
+      1,
+      2,
+      4,
+      8
+    ]
+  },
+  "interleave_cycle_length": {
+    "type": "int",
+    "values": [
+      1,
+      2,
+      4,
+      8
+    ]
+  }
+}
