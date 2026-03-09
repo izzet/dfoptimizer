@@ -68,7 +68,7 @@ def main():
     parser.add_argument("--input-topic", default=os.environ.get("DFOPTIMIZER_INPUT_TOPIC", "diagnosis.findings"))
     parser.add_argument("--output-topic", default=os.environ.get("DFOPTIMIZER_OUTPUT_TOPIC", "optimizer.plans"))
     parser.add_argument("--registry-topic", default=os.environ.get("DFOPTIMIZER_REGISTRY_TOPIC", "optimizer.registry"))
-    parser.add_argument("--idle-timeout", type=int, default=int(os.environ.get("DFOPTIMIZER_IDLE_TIMEOUT_SEC", "60")))
+    parser.add_argument("--idle-timeout", type=int, default=int(os.environ.get("DFOPTIMIZER_IDLE_TIMEOUT_SEC", "0")))
     parser.add_argument("--pull-timeout-ms", type=int, default=int(os.environ.get("DFOPTIMIZER_PULL_TIMEOUT_MS", "1000")))
     parser.add_argument("--consumer-name", default=os.environ.get("DFOPTIMIZER_CONSUMER_NAME", ""))
     parser.add_argument("--debug", action="store_true", default=os.environ.get("DFOPTIMIZER_DEBUG", "") == "1")

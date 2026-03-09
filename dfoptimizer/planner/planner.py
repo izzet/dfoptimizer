@@ -71,9 +71,12 @@ class Planner:
         logger.info(
             "optimizer.finding.received",
             finding_type=finding.finding_type,
+            scope=finding.scope,
+            layer=finding.layer,
             motif=finding.motif,
             severity=finding.severity,
             persistence=finding.persistence,
+            support_windows=finding.support_windows,
             trend_direction=finding.trend_direction,
             opportunity_tags=finding.opportunity_tags,
             window_index=finding.window_index,
@@ -86,6 +89,16 @@ class Planner:
         # Gate 1: motif-based skip
         if finding.motif == "warmup_transient":
             logger.info("optimizer.finding.skipped", finding_type=finding.finding_type, reason="warmup_transient")
+            return plans
+
+        if finding.publish_mode != "control":
+            logger.info(
+                "optimizer.finding.skipped",
+                finding_type=finding.finding_type,
+                scope=finding.scope,
+                reason="non_control_publish_mode",
+                publish_mode=finding.publish_mode,
+            )
             return plans
 
         # Gate 2: improving trend — don't fix what's getting better
@@ -157,17 +170,11 @@ class Planner:
         if response.direction == "set":
             new_value = response.set_to
         elif response.direction == "increase":
-            scale = 0.5 + 0.5 * severity_score  # [0.5, 1.0]
-            if finding.trend_direction == "stable":
-                scale *= 0.5
-            step = response.step * scale
-            new_value = old_value + kdef.type(step)
+            delta = self._scaled_delta(kdef, response.step, severity_score, finding)
+            new_value = old_value + delta
         elif response.direction == "decrease":
-            scale = 0.5 + 0.5 * severity_score
-            if finding.trend_direction == "stable":
-                scale *= 0.5
-            step = response.step * scale
-            new_value = old_value - kdef.type(step)
+            delta = self._scaled_delta(kdef, response.step, severity_score, finding)
+            new_value = old_value - delta
         else:
             return None
 
@@ -187,7 +194,7 @@ class Planner:
             rationale=(
                 f"{finding.finding_type}: {finding.motif} "
                 f"(severity={finding.severity}, persistence={finding.persistence}, "
-                f"trend={finding.trend_direction}) -> {tag}"
+                f"trend={finding.trend_direction}, scope={finding.scope}) -> {tag}"
             ),
             finding_type=finding.finding_type,
             severity=severity_score,
@@ -208,6 +215,26 @@ class Planner:
             rationale=plan.rationale,
         )
         return plan
+
+    @staticmethod
+    def _scaled_delta(
+        kdef: KnobDef,
+        base_step,
+        severity_score: float,
+        finding: DiagnosisFindingMsg,
+    ):
+        scale = 0.5 + 0.5 * severity_score  # [0.5, 1.0]
+        if finding.trend_direction == "stable":
+            scale *= 0.5
+
+        scaled_step = base_step * scale
+        if kdef.type is int:
+            if scaled_step <= 0:
+                return 0
+            if scaled_step < 1:
+                return 1
+            return int(scaled_step)
+        return kdef.type(scaled_step)
 
     def apply_ack(self, plan_id: str, knob_id: str, status: str,
                   old_value=None, new_value=None):

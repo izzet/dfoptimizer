@@ -12,6 +12,7 @@ knob responses and emit ActionPlans.
 import dataclasses
 import json
 import os
+import signal
 import threading
 import time
 from typing import Dict, List
@@ -23,6 +24,20 @@ from .runtime.knob import knob_def_from_wire
 from .planner.planner import Planner
 
 logger = structlog.get_logger()
+
+_shutdown_requested = False
+
+
+def _sigterm_handler(signum, frame):
+    del signum, frame
+    global _shutdown_requested
+    _shutdown_requested = True
+
+
+def install_shutdown_handler():
+    global _shutdown_requested
+    _shutdown_requested = False
+    signal.signal(signal.SIGTERM, _sigterm_handler)
 
 
 class Optimizer:
@@ -37,7 +52,7 @@ class Optimizer:
         output_topic: str = "optimizer.plans",
         registry_topic: str = "optimizer.registry",
         consumer_name: str = "",
-        idle_timeout_sec: int = 60,
+        idle_timeout_sec: int = 0,
         pull_timeout_ms: int = 1000,
     ):
         from .streaming.mofka_io import open_consumer, open_producer
@@ -53,6 +68,8 @@ class Optimizer:
             group_file, registry_topic,
             consumer_name=f"dfoptimizer_registry_{os.getpid()}",
         )
+
+        install_shutdown_handler()
 
         # Start registry listener in background thread (consumer already open)
         registry_thread = threading.Thread(
@@ -80,7 +97,7 @@ class Optimizer:
 
         try:
             future = consumer.pull()
-            while True:
+            while not _shutdown_requested:
                 now = time.monotonic()
                 if (
                     last_event_time is not None
@@ -122,8 +139,12 @@ class Optimizer:
                 event.acknowledge()
                 future = consumer.pull()
 
+            if _shutdown_requested:
+                logger.info("optimizer.stream.stop_signal", signal="SIGTERM")
+
         finally:
             producer.flush()
+            registry_thread.join(timeout=wait_ms / 1000.0 + 1.0)
             logger.info(
                 "optimizer.stream.done",
                 event_count=event_count,
@@ -150,7 +171,7 @@ class Optimizer:
         logger.info("optimizer.registry.listening", topic=registry_topic)
         future = consumer.pull()
 
-        while True:
+        while not _shutdown_requested:
             try:
                 event = future.wait(timeout_ms=1000)
             except Exception as ex:
@@ -169,6 +190,9 @@ class Optimizer:
 
             event.acknowledge()
             future = consumer.pull()
+
+        if _shutdown_requested:
+            logger.info("optimizer.registry.stop_signal", signal="SIGTERM")
 
         del consumer
 
@@ -225,12 +249,16 @@ class Optimizer:
 
         return DiagnosisFindingMsg(
             finding_type=msg.get("finding_type", ""),
+            scope=msg.get("scope", ""),
+            layer=msg.get("layer"),
             motif=msg.get("motif", "unclassified"),
             severity=msg.get("severity", "unknown"),
             confidence=msg.get("confidence", 0),
             prevalence=msg.get("prevalence", 0),
             persistence=msg.get("persistence", 0),
+            support_windows=msg.get("support_windows", 0),
             trend_direction=msg.get("trend_direction", "insufficient_data"),
+            last_seen_window=msg.get("last_seen_window", msg.get("window_index", 0)),
             contributing_facts=[
                 tuple(f) for f in msg.get("contributing_facts", [])
             ],
@@ -238,6 +266,7 @@ class Optimizer:
             opportunity_tags=msg.get("opportunity_tags", []),
             summary=msg.get("summary", ""),
             window_index=msg.get("window_index", 0),
+            publish_mode=msg.get("publish_mode", "control"),
         )
 
     def _publish_plan(self, producer, plan: ActionPlan):

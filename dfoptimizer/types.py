@@ -82,7 +82,12 @@ class DiagnosisFindingMsg:
     recommendation_bundle: str
     opportunity_tags: List[str]
     summary: str
+    scope: str = ""
+    layer: Optional[str] = None
+    support_windows: int = 0
+    last_seen_window: int = 0
     window_index: int = 0
+    publish_mode: str = "control"
 
 
 @dc.dataclass
