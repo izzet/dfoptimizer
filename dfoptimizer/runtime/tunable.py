@@ -30,31 +30,55 @@ def tunable(knobs: Dict[str, dict]):
     optimizer service so it can build action rules dynamically.
     """
 
-    # We defer building KnobDefs until first call, when context + namespace are known
+    # We defer building KnobDefs until context + namespace are known.
     _knob_specs = knobs  # raw dicts from knob()
     _registered = False
 
     def decorator(func):
         func_name = func.__qualname__
 
-        @functools.wraps(func)
-        def wrapper(*args, **kwargs):
+        def _build_knob_defs(wrapper, namespace: str):
+            if wrapper._tunable_knobs and wrapper._tunable_namespace == namespace:
+                return wrapper._tunable_knobs
+
+            knob_defs = {}
+            for param_name, spec in _knob_specs.items():
+                full_id = f"{namespace}.{param_name}"
+                knob_defs[param_name] = knob_def_from_dict(
+                    full_id, spec, target_function=func_name
+                )
+
+            wrapper._tunable_knobs = knob_defs
+            wrapper._tunable_namespace = namespace
+            return knob_defs
+
+        def _register_knobs(wrapper, ctx, current_values=None):
             nonlocal _registered
 
+            if _registered:
+                return
+
+            knob_defs = _build_knob_defs(wrapper, ctx.namespace)
+            ctx.register_knobs(
+                func_name,
+                knob_defs,
+                current_values=current_values or {},
+            )
+            _registered = True
+
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
             ctx = _ctx_module._global_context
             if ctx is None or ctx._noop:
                 return func(*args, **kwargs)
 
-            # One-time registration: build KnobDefs with namespace + publish
             if not _registered:
-                namespace = ctx.namespace
-                for param_name, spec in _knob_specs.items():
-                    full_id = f"{namespace}.{param_name}"
-                    kdef = knob_def_from_dict(full_id, spec, target_function=func_name)
-                    wrapper._tunable_knobs[param_name] = kdef
-
-                ctx.register_knobs(func_name, wrapper._tunable_knobs)
-                _registered = True
+                live_values = {
+                    param_name: kwargs[param_name]
+                    for param_name in _knob_specs
+                    if param_name in kwargs
+                }
+                _register_knobs(wrapper, ctx, current_values=live_values)
 
             # Drain pending actions for this function
             namespace = ctx.namespace
@@ -111,7 +135,11 @@ def tunable(knobs: Dict[str, dict]):
 
         # Attach metadata for introspection (populated on first call)
         wrapper._tunable_knobs = {}
+        wrapper._tunable_namespace = None
         wrapper._tunable_func_name = func_name
+        wrapper._tunable_register = lambda ctx, current_values=None, _wrapper=wrapper: _register_knobs(
+            _wrapper, ctx, current_values=current_values
+        )
         return wrapper
 
     return decorator

@@ -207,20 +207,38 @@ class Optimizer:
         namespace = msg.get("namespace", "app")
         func_name = msg.get("function_name", "")
         knobs_wire = msg.get("knobs", {})
+        wire_current_values = msg.get("current_values", {})
+
+        # DFTracer sends knobs as a JSON array of objects (each with "id"),
+        # while DLIO sends a dict keyed by param name.  Normalize to dict.
+        if isinstance(knobs_wire, list):
+            knobs_wire = {k.get("id", f"knob_{i}"): k for i, k in enumerate(knobs_wire)}
 
         knob_defs = {}
+        current_values = {}
         for param_name, kw in knobs_wire.items():
+            # DFTracer uses "knob_response" (single response applied to all
+            # severity tags), while DLIO uses "responds_to" (tag -> response
+            # dict).  Normalize to responds_to format.
+            if "knob_response" in kw and "responds_to" not in kw:
+                resp = kw.pop("knob_response")
+                kw["responds_to"] = {"io_bottleneck": resp}
             kdef = knob_def_from_wire(kw)
             knob_defs[kdef.id] = kdef
+            if param_name in wire_current_values:
+                current_values[kdef.id] = wire_current_values[param_name]
+            elif kdef.id in wire_current_values:
+                current_values[kdef.id] = wire_current_values[kdef.id]
 
         logger.info(
             "optimizer.registry.received",
             namespace=namespace,
             function=func_name,
             knobs=list(knob_defs.keys()),
+            current_values=current_values,
         )
 
-        self.planner.register_knobs(knob_defs)
+        self.planner.register_knobs(knob_defs, current_values=current_values)
 
     def _parse_finding(self, event) -> DiagnosisFindingMsg | None:
         raw_metadata = event.metadata if hasattr(event, "metadata") else None

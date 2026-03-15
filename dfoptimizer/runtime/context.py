@@ -49,6 +49,8 @@ class OptimizerContext:
         self._lock = threading.Lock()
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        self._consumer = None
+        self._listener_driver = None
         self._producer = None  # for acks
         self._registry_producer = None  # for knob registration
         self._noop = False
@@ -69,6 +71,10 @@ class OptimizerContext:
         if self._thread is not None:
             self._thread.join(timeout=5)
             self._thread = None
+        self._release_producer("_producer")
+        self._release_producer("_registry_producer")
+        self._consumer = None
+        self._listener_driver = None
         logger.info("optimizer.context.stopped")
 
     def drain_actions_for(self, func_name: str) -> List[ActionPlan]:
@@ -101,7 +107,12 @@ class OptimizerContext:
         with self._lock:
             self._queues[plan.target_function][plan.knob_id] = plan
 
-    def register_knobs(self, func_name: str, knob_defs: Dict[str, KnobDef]):
+    def register_knobs(
+        self,
+        func_name: str,
+        knob_defs: Dict[str, KnobDef],
+        current_values: Optional[Dict[str, object]] = None,
+    ):
         """Publish knob definitions to the optimizer registry topic."""
         from .knob import knob_def_to_wire
 
@@ -113,6 +124,7 @@ class OptimizerContext:
             "namespace": self.namespace,
             "function_name": func_name,
             "knobs": knobs_wire,
+            "current_values": current_values or {},
         }
 
         logger.info(
@@ -120,6 +132,7 @@ class OptimizerContext:
             namespace=self.namespace,
             function=func_name,
             knobs=list(knobs_wire.keys()),
+            current_values=registration["current_values"],
         )
 
         self._publish_registration(registration)
@@ -141,6 +154,9 @@ class OptimizerContext:
             )
             self._noop = True
             return
+
+        self._listener_driver = driver
+        self._consumer = consumer
 
         future = consumer.pull()
         while self._running:
@@ -165,6 +181,8 @@ class OptimizerContext:
 
         del consumer
         del driver
+        self._consumer = None
+        self._listener_driver = None
 
     def _handle_plan_event(self, event):
         payload = event.data
@@ -242,6 +260,16 @@ class OptimizerContext:
             )
         except Exception:
             logger.warning("optimizer.knobs.publish_failed", exc_info=True)
+
+    def _release_producer(self, attr_name: str):
+        producer = getattr(self, attr_name, None)
+        if producer is None:
+            return
+        try:
+            producer.flush()
+        except Exception:
+            logger.warning("optimizer.context.producer_flush_failed", producer_attr=attr_name, exc_info=True)
+        setattr(self, attr_name, None)
 
 
 class _NoopContext(OptimizerContext):

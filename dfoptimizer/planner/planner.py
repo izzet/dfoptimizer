@@ -47,11 +47,19 @@ class Planner:
         # Index: opportunity_tag -> list of (knob_id, KnobResponse)
         self._responses_by_tag: Dict[str, List[tuple]] = {}
 
-    def register_knobs(self, knob_defs: Dict[str, KnobDef]):
+    def register_knobs(
+        self,
+        knob_defs: Dict[str, KnobDef],
+        current_values: Optional[Dict[str, object]] = None,
+    ):
         """Add knobs from an app registration. Rebuilds the tag index."""
+        current_values = current_values or {}
         for knob_id, kdef in knob_defs.items():
             self.knobs[knob_id] = kdef
-            self.current_values.setdefault(knob_id, kdef.default)
+            if knob_id in current_values:
+                self.current_values[knob_id] = current_values[knob_id]
+            else:
+                self.current_values.setdefault(knob_id, kdef.default)
 
             for tag, response in kdef.responds_to.items():
                 self._responses_by_tag.setdefault(tag, []).append(
@@ -62,6 +70,7 @@ class Planner:
             "optimizer.planner.updated",
             knob_count=len(self.knobs),
             tag_count=len(self._responses_by_tag),
+            current_values=dict(self.current_values),
         )
 
     def process_finding(self, finding: DiagnosisFindingMsg) -> List[ActionPlan]:
