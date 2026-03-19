@@ -68,6 +68,10 @@ class Optimizer:
             group_file, registry_topic,
             consumer_name=f"dfoptimizer_registry_{os.getpid()}",
         )
+        _, ack_consumer = open_consumer(
+            group_file, "optimizer_acks",
+            consumer_name=f"dfoptimizer_acks_{os.getpid()}",
+        )
 
         install_shutdown_handler()
 
@@ -79,6 +83,15 @@ class Optimizer:
             name="optimizer-registry",
         )
         registry_thread.start()
+
+        # Start ack listener in background thread
+        ack_thread = threading.Thread(
+            target=self._ack_loop,
+            args=(ack_consumer,),
+            daemon=True,
+            name="optimizer-acks",
+        )
+        ack_thread.start()
 
         event_count = 0
         plan_count = 0
@@ -145,6 +158,7 @@ class Optimizer:
         finally:
             producer.flush()
             registry_thread.join(timeout=wait_ms / 1000.0 + 1.0)
+            ack_thread.join(timeout=wait_ms / 1000.0 + 1.0)
             logger.info(
                 "optimizer.stream.done",
                 event_count=event_count,
@@ -194,6 +208,46 @@ class Optimizer:
         if _shutdown_requested:
             logger.info("optimizer.registry.stop_signal", signal="SIGTERM")
 
+        del consumer
+
+    def _ack_loop(self, consumer):
+        """Background thread: listen for plan acks from apps."""
+        logger.info("optimizer.acks.listening")
+        future = consumer.pull()
+
+        while not _shutdown_requested:
+            try:
+                event = future.wait(timeout_ms=1000)
+            except Exception as ex:
+                if "timeout" in str(ex).lower():
+                    continue
+                logger.error("optimizer.acks.listen_error", error=str(ex))
+                break
+
+            if event is None:
+                continue
+
+            try:
+                payload = event.data
+                if isinstance(payload, list):
+                    payload = b"".join(payload)
+                msg = json.loads(payload.decode("utf-8"))
+                self.planner.apply_ack(
+                    plan_id=msg.get("plan_id", ""),
+                    knob_id=msg.get("knob_id", ""),
+                    status=msg.get("status", "unknown"),
+                    old_value=msg.get("old_value"),
+                    new_value=msg.get("new_value"),
+                    window_index=msg.get("window_index", -1),
+                )
+            except Exception:
+                logger.exception("optimizer.acks.error")
+
+            event.acknowledge()
+            future = consumer.pull()
+
+        if _shutdown_requested:
+            logger.info("optimizer.acks.stop_signal", signal="SIGTERM")
         del consumer
 
     def _handle_registration(self, event):

@@ -47,6 +47,9 @@ class Planner:
         # Index: opportunity_tag -> list of (knob_id, KnobResponse)
         self._responses_by_tag: Dict[str, List[tuple]] = {}
 
+        # Pending plans: knob_id -> plan_id (published but not yet applied)
+        self._pending_plans: Dict[str, str] = {}
+
     def register_knobs(
         self,
         knob_defs: Dict[str, KnobDef],
@@ -121,7 +124,16 @@ class Planner:
         for tag in finding.opportunity_tags:
             responses = self._responses_by_tag.get(tag, [])
             for knob_id, response in responses:
-                # Gate 3: severity threshold
+                # Gate 3: pending plan — don't stack plans before previous is applied
+                if knob_id in self._pending_plans:
+                    logger.debug(
+                        "optimizer.gate.rejected",
+                        knob_id=knob_id, tag=tag, gate="pending_plan",
+                        pending_plan_id=self._pending_plans[knob_id],
+                    )
+                    continue
+
+                # Gate 4: severity threshold (was gate 3)
                 if severity_score < response.min_severity:
                     logger.debug(
                         "optimizer.gate.rejected",
@@ -211,9 +223,9 @@ class Planner:
             window_index=finding.window_index,
         )
 
-        # Update state
+        # Update state: mark as pending until app acks
         self.current_values[knob_id] = new_value
-        self.cooldown.record(knob_id, finding.window_index)
+        self._pending_plans[knob_id] = plan.plan_id
 
         logger.info(
             "optimizer.plan.created",
@@ -246,8 +258,12 @@ class Planner:
         return kdef.type(scaled_step)
 
     def apply_ack(self, plan_id: str, knob_id: str, status: str,
-                  old_value=None, new_value=None):
-        """Process an ACK from the app."""
+                  old_value=None, new_value=None, window_index: int = -1):
+        """Process an ACK from the app.
+
+        Clears the pending-plan gate for this knob and starts cooldown
+        from the APPLICATION window (not the publish window).
+        """
         logger.info(
             "optimizer.ack.received",
             plan_id=plan_id,
@@ -255,12 +271,34 @@ class Planner:
             status=status,
             old_value=old_value,
             new_value=new_value,
+            window_index=window_index,
         )
 
-        if status == "rejected":
-            kdef = self.knobs.get(knob_id)
-            if kdef:
-                self.current_values[knob_id] = kdef.default
+        # Clear pending state regardless of status
+        pending_plan = self._pending_plans.pop(knob_id, None)
+        if pending_plan and pending_plan != plan_id:
+            logger.warning(
+                "optimizer.ack.plan_id_mismatch",
+                expected=pending_plan,
+                received=plan_id,
+                knob_id=knob_id,
+            )
+
+        if status == "applied":
+            # Update current value to what was actually applied
+            if new_value is not None:
+                self.current_values[knob_id] = new_value
+            # Start cooldown from APPLICATION point, not publish point
+            if window_index >= 0:
+                self.cooldown.record(knob_id, window_index)
+        elif status == "rejected":
+            # Revert current value — plan was not applied
+            if old_value is not None:
+                self.current_values[knob_id] = old_value
+            else:
+                kdef = self.knobs.get(knob_id)
+                if kdef:
+                    self.current_values[knob_id] = kdef.default
             logger.warning(
                 "optimizer.ack.rejected",
                 plan_id=plan_id,
