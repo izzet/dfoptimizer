@@ -10,11 +10,12 @@ from dfoptimizer.types import DiagnosisFindingMsg, KnobDef
 
 
 def _knobs():
+    # Dict[str knob_id, KnobDef] exactly as the optimizer's _handle_registration passes it.
     kw = KnobDef(id="stormer.num_workers", default=1, type=int, range=(1, 8),
                  target_function="stormer.make_loader")
     kb = KnobDef(id="stormer.bucket_cap", default=25, type=int, range=(25, 400),
                  target_function="stormer.setup_ddp")
-    return [kw, kb]
+    return {kw.id: kw, kb.id: kb}
 
 
 def _finding(window_index, key_metrics, ftype="fetch_pressure"):

@@ -80,14 +80,16 @@ class CLBOPlanner:
 
     # --- Planner-compatible registration ---
     def register_knobs(self, knob_defs, current_values=None):
+        # Matches Planner.register_knobs: knob_defs is a Dict[str knob_id, KnobDef].
         current_values = current_values or {}
-        for kd in knob_defs:
-            self.knobs[kd.id] = kd
-            short = kd.id.split(".")[-1]
-            self._short[kd.id] = short
-            self._target_fn[kd.id] = kd.target_function
-            cur = current_values.get(kd.id, kd.default)
-            self.current_values[kd.id] = cur
+        items = knob_defs.items() if hasattr(knob_defs, "items") else ((kd.id, kd) for kd in knob_defs)
+        for knob_id, kd in items:
+            self.knobs[knob_id] = kd
+            short = knob_id.split(".")[-1]
+            self._short[knob_id] = short
+            self._target_fn[knob_id] = kd.target_function
+            cur = current_values.get(knob_id, kd.default)
+            self.current_values[knob_id] = cur
             self._domain[short] = _domain_of(short)
             self._levels[short] = _levels_for(kd, cur)
         shorts = [self._short[k] for k in self.knobs]
