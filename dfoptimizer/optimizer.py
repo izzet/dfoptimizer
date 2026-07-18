@@ -25,6 +25,18 @@ from .planner.planner import Planner
 
 logger = structlog.get_logger()
 
+
+def _make_planner():
+    """Select the optimizer algorithm. Default = the rule/Amdahl Planner (LiveIO byte-identical).
+    DFOPTIMIZER_ALGO=clbo selects the factored cross-layer surrogate (LiveFlow), imported lazily
+    so LiveIO runs never load it."""
+    algo = os.environ.get("DFOPTIMIZER_ALGO", "planner").lower()
+    if algo == "clbo":
+        from .planner.clbo_planner import CLBOPlanner
+        logger.info("optimizer.algo.selected", algo="clbo")
+        return CLBOPlanner()
+    return Planner()
+
 _shutdown_requested = False
 
 
@@ -42,7 +54,7 @@ def install_shutdown_handler():
 
 class Optimizer:
     def __init__(self):
-        self.planner = Planner()
+        self.planner = _make_planner()
         self._plans_produced = 0
         self._output_topic = ""
         self._plan_fanout = 1
