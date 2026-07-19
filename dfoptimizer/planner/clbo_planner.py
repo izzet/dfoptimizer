@@ -32,6 +32,7 @@ _DOMAIN_OF = {
     "num_workers": "input", "prefetch_factor": "input", "prefetch_size": "input",
     "read_threads": "input", "reader_threads": "input",
     "bucket_cap": "comm", "bucket_cap_mb": "comm", "reduce_bucket_size": "comm",
+    "accumulate_grad_batches": "comm", "accum": "comm",
 }
 
 
