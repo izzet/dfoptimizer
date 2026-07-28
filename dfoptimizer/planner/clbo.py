@@ -173,7 +173,11 @@ class FactoredSurrogate:
         knobs = list(cfgs[0].keys())
         self.subs = {}      # domain -> (GP, encoder) for domains with knobs
         self.const = {}     # domain -> mean time for domains without knobs
-        for dom in ("input", "comm", "compute"):
+        # Domain set is derived from the knob->domain map (plus the 'compute' floor), so the factored
+        # surrogate supports ANY number of relievable domains -- input/comm, or storage/decode/comm
+        # for the three-way (cross-layer) pipeline -- not just a fixed input/comm/compute triple.
+        self._domains = set(self.kd.values()) | {"compute"}
+        for dom in self._domains:
             sub = [k for k in knobs if self.kd.get(k) == dom]
             y = [d.get(dom, 0.0) for d in domain_obs]
             if sub:
@@ -186,14 +190,14 @@ class FactoredSurrogate:
     def predict(self, cfgs):
         mu = np.zeros(len(cfgs))
         var = np.zeros(len(cfgs))
-        for dom in ("input", "comm", "compute"):
+        for dom in self._domains:
             if dom in self.subs:
                 gp, e = self.subs[dom]
                 m, s = gp.predict([e(c) for c in cfgs])
                 var = var + s ** 2
             else:
                 m = np.full(len(cfgs), self.const.get(dom, 0.0))
-            # input/comm hide under the compute floor up to overlap; compute always adds
+            # relievable domains hide under the compute floor up to overlap; compute always adds
             mu = mu + (m if dom == "compute" else np.maximum(0.0, m - self.ov))
         return mu, np.sqrt(var)
 

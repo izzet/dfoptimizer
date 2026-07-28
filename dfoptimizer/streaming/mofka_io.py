@@ -21,11 +21,18 @@ def _load_mofka():
 
 def _get_driver(group_file: str, use_progress_thread: bool):
     global _driver_singleton, _driver_pid
+    # DFOPTIMIZER_MOFKA_PROGRESS_THREAD overrides: "0" disables the dedicated (busy-spinning) Mercury
+    # progress thread -> progress is driven on-demand by the calling thread. Used to test whether the
+    # progress thread starves NCCL-P2P at scale (halo3d 16-way hang). Default unchanged (True).
+    _env = os.environ.get("DFOPTIMIZER_MOFKA_PROGRESS_THREAD")
+    if _env is not None:
+        use_progress_thread = _env == "1"
     with _driver_lock:
         if _driver_singleton is None or _driver_pid != os.getpid():
             mofka = _load_mofka()
             _driver_pid = os.getpid()
-            logger.info("mofka.driver.create", pid=_driver_pid, group=group_file)
+            logger.info("mofka.driver.create", pid=_driver_pid, group=group_file,
+                        use_progress_thread=use_progress_thread)
             _driver_singleton = mofka.MofkaDriver(
                 group_file=group_file,
                 use_progress_thread=use_progress_thread,

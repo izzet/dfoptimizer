@@ -57,6 +57,19 @@ class OptimizerContext:
         self._global_ack_producer = None
         self._global_registry_producer = None
         self._noop = False
+        # Pause flag: when set, the background listener stays ALIVE but stops pulling from Mofka. Lets
+        # a caller confine the consumer's Margo progress to safe moments (e.g. window boundaries, off
+        # the per-step NCCL-P2P critical path) WITHOUT tearing down/recreating the consumer thread
+        # (which desyncs collective apply at scale). Opt-in; default = not paused (unchanged behavior).
+        self._paused = threading.Event()
+
+    def pause(self):
+        """Stop the listener from pulling (thread stays alive)."""
+        self._paused.set()
+
+    def resume(self):
+        """Resume pulling."""
+        self._paused.clear()
 
     def start(self):
         """Start the background Mofka listener thread."""
@@ -181,6 +194,11 @@ class OptimizerContext:
 
         future = consumer.pull()
         while self._running:
+            if self._paused.is_set():
+                # Paused: do NOT drive Margo progress (keeps the consumer off the NCCL-P2P path).
+                import time as _t
+                _t.sleep(0.02)
+                continue
             try:
                 event = future.wait(timeout_ms=500)
             except Exception as ex:

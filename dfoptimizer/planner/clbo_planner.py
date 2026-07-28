@@ -31,6 +31,11 @@ from .clbo import StructuredCLBO
 _DOMAIN_OF = {
     "num_workers": "input", "prefetch_factor": "input", "prefetch_size": "input",
     "read_threads": "input", "reader_threads": "input",
+    # halo3d three-way (storage<->decode<->comm): read_threads keeps domain "input" but for that
+    # workload "input"==STORAGE (the analyzer emits storage_time as the input metric); decode_threads
+    # is its own DECODE domain; halo_width is the COMM knob.
+    "decode_threads": "decode",
+    "halo_width": "comm",
     "bucket_cap": "comm", "bucket_cap_mb": "comm", "reduce_bucket_size": "comm",
     "accumulate_grad_batches": "comm", "accum": "comm",
 }
@@ -114,11 +119,17 @@ class CLBOPlanner:
         if wall is None or wall <= 0:
             return None
         fetch = m.get("fetch_iter_time_proc_max", 0.0)
+        # THREE-WAY: split the input pole into STORAGE (POSIX read) and DECODE (app region). The
+        # analyzer emits storage_time/decode_time when present; else this is a two-domain workload
+        # and "input" stays the whole fetch (storage fallback = fetch, decode = 0) -> DLIO/stormer
+        # unchanged (their surrogate models only {input,comm,compute}, ignoring the extra decode key).
+        storage = m.get("reader_posix_time_proc_max", fetch)   # POSIX read = STORAGE domain
+        decode = m.get("reader_decode_time_proc_max", 0.0)     # data.decode = DECODE domain
         comm = m.get("comm_time_proc_max", 0.0)
         pure_compute = max(m.get("compute_time_proc_max", 0.0) - comm, 0.0)
         cfg = self._planned_cfg.get(window, self._default_short)
         return {"cfg": dict(cfg),
-                "domains": {"input": fetch, "comm": comm, "compute": pure_compute},
+                "domains": {"input": storage, "decode": decode, "comm": comm, "compute": pure_compute},
                 "wall": float(wall)}
 
     # --- Planner-compatible decision entry ---
