@@ -75,6 +75,11 @@ class CLBOPlanner:
         self._clbo: Optional[StructuredCLBO] = None
         self._default_short: Dict[str, object] = {}
         self._planned_cfg: Dict[int, dict] = {}   # window_index -> config that runs it
+        # Exploration budget: after this many decisions, DEPLOY the incumbent instead of probing.
+        # None (default) = probe forever = historical behaviour. See process_finding().
+        _ew = os.environ.get("DFOPTIMIZER_CLBO_EXPLORE_WINDOWS", "").strip()
+        self._explore_windows = int(_ew) if _ew.isdigit() and int(_ew) > 0 else None
+        self._decisions = 0
         self._cfgs: List[dict] = []
         self._domain_obs: List[dict] = []
         self._walls: List[float] = []
@@ -154,9 +159,26 @@ class CLBOPlanner:
             self._walls.append(obs["wall"])
             if obs["wall"] < self._inc_wall * (1.0 - self.effect_floor):
                 self._inc_wall, self._inc_cfg = obs["wall"], obs["cfg"]
-            nxt = self._clbo.suggest(self._cfgs, self._domain_obs, self._walls)
-            if nxt is None:                      # grid exhausted -> steer back to the incumbent
-                nxt = self._inc_cfg
+            # PROBE vs DEPLOY. Offline BO optimizes only the FINAL answer, so it deploys every
+            # suggestion; ONLINE control pays for every probe in real run time. Deploying each
+            # suggestion means the run lives in exploratory -- sometimes worst -- configurations:
+            # measured on the storage-bound regime the controller found rt=3 (25 ms) then abandoned it
+            # for rt=1 (77 ms) and ended there, netting 0% against a static baseline despite 73%
+            # available headroom (LIVEFLOW-STATUS.md sec 18).
+            # DFOPTIMIZER_CLBO_EXPLORE_WINDOWS=K spends the first K decisions probing, then DEPLOYS THE
+            # INCUMBENT for the rest of the run. Default (unset) = probe forever = previous behaviour,
+            # so StorMer/DLIO are unaffected.
+            # NOTE this is deliberately NOT a safety guard/veto: nothing here is vetoed for being
+            # harmful, and no guard metric separate from the objective is consulted. It is a dwell/
+            # scheduling policy addressing exploration REGRET (see sec 18.7 on the LiveIO boundary).
+            self._decisions += 1
+            if self._explore_windows is not None and self._decisions > self._explore_windows \
+                    and self._inc_cfg is not None:
+                nxt = self._inc_cfg              # exploitation phase: hold the best known config
+            else:
+                nxt = self._clbo.suggest(self._cfgs, self._domain_obs, self._walls)
+                if nxt is None:                  # grid exhausted -> steer back to the incumbent
+                    nxt = self._inc_cfg
             if nxt is not None:
                 self._planned_cfg[w + 1] = dict(nxt)   # takes effect for the next window
                 plans = self._plans_for(nxt, finding)
