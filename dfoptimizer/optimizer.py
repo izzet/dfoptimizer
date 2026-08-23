@@ -19,6 +19,8 @@ from typing import Dict, List
 
 import structlog
 
+from .streaming.transport import ack_event
+
 from .types import ActionPlan, DiagnosisFindingMsg, KnobDef
 from .runtime.knob import knob_def_from_dict, knob_def_from_wire
 from .planner.planner import Planner
@@ -47,8 +49,20 @@ def _sigterm_handler(signum, frame):
 
 
 def install_shutdown_handler():
+    """Install the SIGTERM handler. No-op off the main thread.
+
+    `signal.signal` raises ValueError anywhere but the main thread, and under the Option C node
+    agent (LIVEFLOW-ARCHITECTURE.md sec 6) this optimizer runs as ONE THREAD alongside the
+    analyzer and diagnoser instead of owning a process. Signal disposition is process-wide, so a
+    stage thread was never the right place to set it: whoever owns the process installs the
+    handler and shuts the stages down through the same flag.
+
+    Same change as dfanalyzer's install_shutdown_handler, for the same reason.
+    """
     global _shutdown_requested
     _shutdown_requested = False
+    if threading.current_thread() is not threading.main_thread():
+        return
     signal.signal(signal.SIGTERM, _sigterm_handler)
 
 
@@ -207,7 +221,7 @@ class Optimizer:
         global_input_topic: str = "global_plans",
         relay_only: bool = False,
     ):
-        from .streaming.mofka_io import open_consumer, open_producer
+        from .streaming.transport import open_consumer, open_producer
 
         self._output_topic = output_topic
         if output_topic == "global_plans":
@@ -331,7 +345,7 @@ class Optimizer:
                     except Exception:
                         logger.exception("optimizer.global_relay.process_error")
 
-                    event.acknowledge()
+                    ack_event(event)
                     global_future = global_consumer.pull()
             else:
                 future = consumer.pull()
@@ -374,7 +388,7 @@ class Optimizer:
                         error_count += 1
                         logger.exception("optimizer.event.error", event_index=event_count)
 
-                    event.acknowledge()
+                    ack_event(event)
                     future = consumer.pull()
 
             if _shutdown_requested:
@@ -403,7 +417,7 @@ class Optimizer:
         """Background thread: listen for knob registrations from apps."""
         if consumer is None:
             try:
-                from .streaming.mofka_io import open_consumer
+                from .streaming.transport import open_consumer
                 _, consumer = open_consumer(
                     group_file, registry_topic,
                     consumer_name=f"dfoptimizer_registry_{os.getpid()}",
@@ -432,7 +446,7 @@ class Optimizer:
             except Exception:
                 logger.exception("optimizer.registry.error")
 
-            event.acknowledge()
+            ack_event(event)
             future = consumer.pull()
 
         if _shutdown_requested:
@@ -474,7 +488,7 @@ class Optimizer:
             except Exception:
                 logger.exception("optimizer.acks.error")
 
-            event.acknowledge()
+            ack_event(event)
             future = consumer.pull()
 
         if _shutdown_requested:
@@ -508,7 +522,7 @@ class Optimizer:
             except Exception:
                 logger.exception("optimizer.global_relay.process_error")
 
-            event.acknowledge()
+            ack_event(event)
             future = consumer.pull()
 
         logger.info(

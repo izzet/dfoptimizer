@@ -1,5 +1,6 @@
 import json
 import os
+import queue
 import socket
 import threading
 from collections import defaultdict
@@ -57,6 +58,25 @@ class OptimizerContext:
         self._global_ack_producer = None
         self._global_registry_producer = None
         self._noop = False
+        # ---- NON-BLOCKING ACK PATH (LIVEFLOW-DECODE-RCA.md sec 11) --------------------------
+        # An ack is a CONFIRMATION, not a barrier: losing one costs the controller a confirmation,
+        # while blocking on one costs the entire job. Yet `_publish_ack` used to push + `flush()`
+        # synchronously ON THE TRAINING THREAD, at a window boundary, only when a knob changed --
+        # an unbounded blocking call sitting on the workload's critical path.
+        #
+        # Principle adopted for this codebase: no control-plane call on the training thread may
+        # block without a bound; where a bound cannot be guaranteed the call moves off-thread and
+        # becomes droppable. So acks are enqueued to a BOUNDED ring and published by a daemon
+        # thread; on overflow they are DROPPED and COUNTED. Degrade by dropping, never by waiting.
+        #
+        # The drop counter is not cosmetic: the paper claims near-zero overhead for the
+        # observability plane, and a silent drop would be exactly the kind of unmeasured loss that
+        # claim cannot afford. It is reported at teardown.
+        self._ack_q: "queue.Queue" = queue.Queue(
+            maxsize=int(os.environ.get("DFOPTIMIZER_ACK_QUEUE", "1024") or 1024))
+        self._ack_dropped = 0
+        self._ack_published = 0
+        self._ack_pub_thread: Optional[threading.Thread] = None
         # Pause flag: when set, the background listener stays ALIVE but stops pulling from Mofka. Lets
         # a caller confine the consumer's Margo progress to safe moments (e.g. window boundaries, off
         # the per-step NCCL-P2P critical path) WITHOUT tearing down/recreating the consumer thread
@@ -72,8 +92,23 @@ class OptimizerContext:
         self._paused.clear()
 
     def start(self):
-        """Start the background Mofka listener thread."""
+        """Start the background Mofka listener thread.
+
+        LIVEFLOW_CTX_LISTEN=0 constructs the context but never starts the listener, so the process
+        holds NO Mofka consumer and never pulls. Diagnostic only (LIVEFLOW-STATUS.md sec 57): every
+        arm carrying an in-rank context wedges at a control-window boundary and every arm without
+        one completes, but "context present" bundles two different things -- a second margo/thallium
+        ENGINE existing in the address space, and a consumer actively PULLING on it. Nothing so far
+        separates them, and they imply different fixes: an engine that is merely resident argues for
+        sharing one runtime, whereas an active consumer argues the control plane must leave the
+        process entirely. The driver is still created lazily by the ack path, so this isolates the
+        pull loop rather than the engine.
+        """
         if self._noop:
+            return
+        if os.environ.get("LIVEFLOW_CTX_LISTEN", "1") == "0":
+            logger.info("optimizer.context.listen_disabled", namespace=self.namespace)
+            self._running = False
             return
         self._running = True
         self._thread = threading.Thread(
@@ -136,6 +171,34 @@ class OptimizerContext:
         )
         self._publish_ack(ack)
 
+    def _ack_publisher_loop(self):
+        """Drain the ack ring and publish. Runs OFF the training thread, so a slow or stuck
+        Mofka push delays acks only -- it can no longer stall the workload."""
+        while True:
+            item = self._ack_q.get()
+            if item is None:                      # shutdown sentinel
+                return
+            payload, metadata = item
+            try:
+                if self._producer is None:
+                    from ..streaming.transport import open_producer
+                    _, self._producer = open_producer(self.group_file, self.topic_acks)
+                self._producer.push(metadata=metadata, data=payload)
+                self._producer.flush()
+                self._ack_published += 1
+                self._publish_global_mirror(
+                    producer_attr="_global_ack_producer",
+                    topic=os.environ.get("DFOPTIMIZER_GLOBAL_ACKS_TOPIC", "optimizer_acks"),
+                    payload=payload,
+                    metadata=metadata,
+                )
+            except Exception:
+                logger.warning("optimizer.ack.publish_failed", exc_info=True)
+
+    def _ack_stats(self) -> dict:
+        return {"published": self._ack_published, "dropped": self._ack_dropped,
+                "queued": self._ack_q.qsize()}
+
     def enqueue_action(self, plan: ActionPlan):
         """Manually enqueue an action (used by tests or direct injection)."""
         with self._lock:
@@ -175,7 +238,7 @@ class OptimizerContext:
 
     def _listen_loop(self):
         try:
-            from ..streaming.mofka_io import open_consumer
+            from ..streaming.transport import ack_event, open_consumer
             driver, consumer = open_consumer(
                 self.group_file,
                 self.topic_plans,
@@ -200,7 +263,23 @@ class OptimizerContext:
                 _t.sleep(0.02)
                 continue
             try:
-                event = future.wait(timeout_ms=500)
+                # POLL TIMEOUT IS A BUSY-SPIN DIAL, NOT JUST A LATENCY DIAL
+                # (LIVEFLOW-STATUS.md sec 57/58).
+                #
+                # mofka v0.8.2 `Promise::wait(timeout_ms)` computes its deadline as
+                #     deadline.tv_nsec = now.tv_nsec + timeout_ms*1e6
+                # and never normalises it. Whenever that sum exceeds 1e9 the timespec is INVALID:
+                # ABT_cond_timedwait returns immediately while the loop guard
+                # (now.tv_nsec < deadline.tv_nsec) can never go false, because a real tv_nsec tops
+                # out at 999,999,999. The "timed wait" degenerates into a tight spin holding a core
+                # until the second rolls over. Upstream fixed exactly this in b677527 (v0.9.0+).
+                #
+                # The overflow probability is timeout_ms/1000, so this value IS the spin rate:
+                #   500 ms -> ~50% of polls spin      10 ms -> ~1%
+                # Until the Mofka upgrade lands, keeping this small is what stops a consumer thread
+                # from starving RCCL's proxy and the Python decode pool in the same process.
+                _poll_ms = int(os.environ.get("DFOPTIMIZER_POLL_TIMEOUT_MS", "10") or 10)
+                event = future.wait(timeout_ms=_poll_ms)
             except Exception as ex:
                 if "timeout" in str(ex).lower():
                     continue
@@ -215,7 +294,7 @@ class OptimizerContext:
             except Exception:
                 logger.exception("optimizer.context.plan_event_error")
 
-            event.acknowledge()
+            ack_event(event)
             future = consumer.pull()
 
         del consumer
@@ -270,33 +349,40 @@ class OptimizerContext:
             self._queues[plan.target_function][plan.knob_id] = plan
 
     def _publish_ack(self, ack: ActionAck):
+        """NON-BLOCKING. Serialise, enqueue, return. The training thread never touches Mofka.
+
+        Was: push + flush() inline, i.e. an unbounded blocking control-plane call on the
+        workload's critical path, firing only when a knob changed. See sec 11 of
+        LIVEFLOW-DECODE-RCA.md for why that is the wrong shape regardless of whether it was the
+        cause of any particular hang.
+        """
         if self._noop or not self.group_file:
             return
         try:
-            if self._producer is None:
-                from ..streaming.mofka_io import open_producer
-                _, self._producer = open_producer(self.group_file, self.topic_acks)
-
             import dataclasses
             payload = json.dumps(dataclasses.asdict(ack)).encode("utf-8")
             metadata = {"type": "action_ack", "plan_id": ack.plan_id}
-            self._producer.push(metadata=metadata, data=payload)
-            self._producer.flush()
-            self._publish_global_mirror(
-                producer_attr="_global_ack_producer",
-                topic=os.environ.get("DFOPTIMIZER_GLOBAL_ACKS_TOPIC", "optimizer_acks"),
-                payload=payload,
-                metadata=metadata,
-            )
+            if self._ack_pub_thread is None:
+                self._ack_pub_thread = threading.Thread(
+                    target=self._ack_publisher_loop, daemon=True, name="dfoptimizer-ackpub")
+                self._ack_pub_thread.start()
+            try:
+                self._ack_q.put_nowait((payload, metadata))
+            except queue.Full:
+                # Degrade by DROPPING, never by waiting. Counted so the loss is measurable --
+                # an unmeasured drop would undermine the near-zero-overhead claim.
+                self._ack_dropped += 1
+                if self._ack_dropped in (1, 10, 100) or self._ack_dropped % 1000 == 0:
+                    logger.warning("optimizer.ack.dropped", total=self._ack_dropped)
         except Exception:
-            logger.warning("optimizer.ack.publish_failed", plan_id=ack.plan_id, exc_info=True)
+            logger.warning("optimizer.ack.enqueue_failed", plan_id=ack.plan_id, exc_info=True)
 
     def _publish_registration(self, registration: dict):
         if self._noop or not self.group_file:
             return
         try:
             if self._registry_producer is None:
-                from ..streaming.mofka_io import open_producer
+                from ..streaming.transport import open_producer
                 _, self._registry_producer = open_producer(
                     self.group_file, self.topic_registry
                 )
@@ -337,7 +423,7 @@ class OptimizerContext:
         try:
             producer = getattr(self, producer_attr, None)
             if producer is None:
-                from ..streaming.mofka_io import open_producer
+                from ..streaming.transport import open_producer
                 _, producer = open_producer(global_group_file, topic)
                 setattr(self, producer_attr, producer)
             producer.push(metadata=metadata, data=payload)

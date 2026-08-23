@@ -52,9 +52,10 @@ class Planner:
         # Index: opportunity_tag -> list of (knob_id, KnobResponse)
         self._responses_by_tag: Dict[str, List[tuple]] = {}
 
-        # Pending plans: (knob_id, node) -> (plan_id, severity_score)
-        # node="" means global (all-node) plan
-        self._pending_plans: Dict[Tuple[str, str], Tuple[str, float]] = {}
+        # Pending plans: (knob_id, node) -> (plan_id, severity_score, plan_window_index)
+        # node="" means global (all-node) plan. The window index is carried because acks
+        # report window_index=-1, and the cooldown record is gated on a valid window.
+        self._pending_plans: Dict[Tuple[str, str], Tuple[str, float, int]] = {}
 
         # Data-driven suppression: tag -> SuppressionRecord
         # Populated when global findings with suppresses_tags pass 4 gates.
@@ -303,10 +304,29 @@ class Planner:
                             suppressed_since_window=suppression.window_index,
                         )
                         continue
+                elif finding.severity_score > suppression.severity:
+                    # Local mode / global scope: severity-weighted agreement, the SAME rule the
+                    # hierarchical branch above applies. The previous behaviour enforced
+                    # suppression unconditionally here, justified as "the same-scope finding that
+                    # set suppression has a stronger signal". That assumption is false and it was
+                    # costing whole runs: in the sec 47 campaign a `comm_dominance` finding with
+                    # severity 0.187 suppressed `fetch_pressure` findings with severity 1.000, so
+                    # the input domain was locked out from window 0 for the entire run. Those runs
+                    # sat ~7x worse than the ones that escaped the race (LIVEFLOW-STATUS.md 48).
+                    #
+                    # A weaker signal must not veto a stronger one. When the suppressed finding is
+                    # itself more severe than the finding that suppressed it, the suppressor is
+                    # stale evidence and the tag is exempt.
+                    logger.info(
+                        "optimizer.suppression.exempted",
+                        tag=tag,
+                        finding_type=finding.finding_type,
+                        scope=finding.scope,
+                        severity=round(finding.severity_score, 3),
+                        suppressed_by=suppression.finding_type,
+                        suppressor_severity=round(suppression.severity, 3),
+                    )
                 else:
-                    # Local mode / global scope: enforce suppression
-                    # unconditionally — the same-scope finding that set
-                    # suppression has a stronger signal.
                     logger.info(
                         "optimizer.suppression.active",
                         tag=tag,
@@ -327,7 +347,15 @@ class Planner:
                 # Pending plan safety check (not a gate — prevents duplicates)
                 pending_key = (knob_id, node)
                 if pending_key in self._pending_plans:
-                    pending_plan_id, _ = self._pending_plans[pending_key]
+                    # Index rather than unpack. The sec 83.5 cooldown fix widened this entry to
+                    # (plan_id, severity_score, window_index) at the write site (line ~497) but
+                    # left this read unpacking two values, so the FIRST time a second finding
+                    # arrived for a knob that already had a pending plan, process_finding raised
+                    # `ValueError: too many values to unpack (expected 2)` and the optimizer
+                    # dropped the event. That is precisely the duplicate-suppression path the
+                    # cooldown and effectiveness gates sit behind, so sec 83.5's fix could never
+                    # take effect past the first plan per knob.
+                    pending_plan_id = self._pending_plans[pending_key][0]
                     logger.debug(
                         "optimizer.gate.rejected",
                         knob_id=knob_id, tag=tag, gate="pending_plan",
@@ -469,7 +497,13 @@ class Planner:
             self.node_values[(knob_id, node)] = new_value
         else:
             self.current_values[knob_id] = new_value
-        self._pending_plans[(knob_id, node)] = (plan.plan_id, severity_score)
+        # Carry the PLAN-TIME window index too. The ack is supposed to supply the window the
+        # plan was applied in, but every observed ack reports window_index=-1, and the record
+        # below is gated on `window_index >= 0` -- so cooldown.record() was never called,
+        # `_last_action` stayed empty, and BOTH the cooldown timer and the effectiveness veto
+        # silently no-opped for the entire life of the planner (LIVEFLOW-STATUS sec 83).
+        self._pending_plans[(knob_id, node)] = (plan.plan_id, severity_score,
+                                                finding.window_index)
 
         logger.info(
             "optimizer.plan.created",
@@ -621,7 +655,7 @@ class Planner:
         pending_key = (knob_id, node)
         pending_entry = self._pending_plans.pop(pending_key, None)
         if pending_entry is not None:
-            pending_plan_id, plan_severity = pending_entry
+            pending_plan_id, plan_severity, plan_window = pending_entry
             if pending_plan_id != plan_id:
                 logger.warning(
                     "optimizer.ack.plan_id_mismatch",
@@ -630,7 +664,24 @@ class Planner:
                     knob_id=knob_id,
                 )
         else:
-            plan_severity = severity_score
+            # No pending entry. This is normally a DUPLICATE ack: under CTX_SCOPE=all
+            # every rank acks the same plan, so only the first ack finds the entry and
+            # the rest land here. It can also be an ack for a plan this instance did not
+            # create.
+            #
+            # There is no severity to recover, and fabricating 0.0 would be worse than
+            # useless: cooldown.record() stores it as severity_at_action, which
+            # CooldownTracker.check() later compares against current severity to decide
+            # whether the last action helped. Writing 0.0 over the real plan-time
+            # severity makes every subsequent action look ineffective. Leave it unknown
+            # and skip the re-record below; the first ack already recorded the truth.
+            #
+            # (Until 2026-08-21 this line read `plan_severity = severity_score`, an
+            # undefined name. It raised NameError on every duplicate ack, which was
+            # invisible only because the sec 61 consumer bug meant plans were never
+            # created in the first place.)
+            plan_severity = None
+            plan_window = -1
 
         if status == "applied":
             # Update current value to what was actually applied
@@ -641,11 +692,22 @@ class Planner:
                     self.current_values[knob_id] = new_value
             # Start cooldown from APPLICATION point, not publish point.
             # Record the severity at plan time for effectiveness comparison.
-            if window_index >= 0:
+            # Prefer the window the app reports it applied in; fall back to the window the
+            # plan was CREATED in when the ack does not carry one (it currently never does).
+            # Without the fallback this record never happens and the gates are inert.
+            _eff_window = window_index if window_index >= 0 else plan_window
+            if _eff_window >= 0 and plan_severity is not None:
                 self.cooldown.record(
-                    knob_id, window_index,
+                    knob_id, _eff_window,
                     severity_score=plan_severity,
                     node=node,
+                )
+                logger.info(
+                    "optimizer.cooldown.recorded",
+                    knob_id=knob_id, node=node or "global",
+                    window_index=_eff_window,
+                    severity_at_action=round(float(plan_severity), 3),
+                    from_ack=bool(window_index >= 0),
                 )
         elif status == "rejected":
             # Revert current value — plan was not applied
