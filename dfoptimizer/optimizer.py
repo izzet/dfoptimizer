@@ -249,10 +249,19 @@ class Optimizer:
                 group_file, registry_topic,
                 consumer_name=f"dfoptimizer_registry_{os.getpid()}",
             )
-            _, ack_consumer = open_consumer(
-                group_file, "optimizer_acks",
-                consumer_name=f"dfoptimizer_acks_{os.getpid()}",
-            )
+
+        # ACKS ARE NOT PART OF THE REGISTRY. This used to sit inside the `if not no_registry`
+        # block above, so --no-registry -- documented as "for a global optimizer that has no knob
+        # defs" -- silently switched off the acknowledgement path as well.
+        #
+        # That matters more than it looks: the cooldown timer and the effectiveness veto only
+        # record on an ack (sec 83.5). With no ack consumer they never record, `_last_action`
+        # stays empty, and both gates return not-blocked forever -- the exact symptom sec 83
+        # spent a session chasing. Two unrelated concerns behind one flag.
+        _, ack_consumer = open_consumer(
+            group_file, "optimizer_acks",
+            consumer_name=f"dfoptimizer_acks_{os.getpid()}",
+        )
 
         # Open global plan consumer (ofi+cxi) in main thread if configured
         global_consumer = None

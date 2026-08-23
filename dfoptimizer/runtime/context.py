@@ -41,6 +41,18 @@ class OptimizerContext:
         self.namespace = namespace
         self.protocol = protocol
         self.group_file = group_file
+        # THE OUTBOUND PATHS MUST NOT GATE ON A MOFKA CONCEPT.
+        #
+        # `_publish_ack` and `_publish_registration` both used to start with
+        # `if self._noop or not self.group_file: return`. Under any transport that addresses
+        # topics by name rather than through a Mofka group file, that silently discarded every
+        # ack and every knob registration BEFORE they were even enqueued -- so the app applied
+        # knobs and logged optimizer.action.ack while the optimizer received nothing, and the
+        # cooldown and effectiveness gates (which only record on an ack, sec 83.5) could never
+        # fire. Three separate places had the same assumption; this is the single predicate they
+        # all now share.
+        self._transport = os.environ.get("LIVEFLOW_TRANSPORT", "mofka").strip().lower()
+        self._can_publish = bool(group_file) or self._transport != "mofka"
         self.topic_plans = topic_plans
         self.topic_acks = topic_acks
         self.topic_registry = topic_registry
@@ -356,7 +368,7 @@ class OptimizerContext:
         LIVEFLOW-DECODE-RCA.md for why that is the wrong shape regardless of whether it was the
         cause of any particular hang.
         """
-        if self._noop or not self.group_file:
+        if self._noop or not self._can_publish:
             return
         try:
             import dataclasses
@@ -378,7 +390,7 @@ class OptimizerContext:
             logger.warning("optimizer.ack.enqueue_failed", plan_id=ack.plan_id, exc_info=True)
 
     def _publish_registration(self, registration: dict):
-        if self._noop or not self.group_file:
+        if self._noop or not self._can_publish:
             return
         try:
             if self._registry_producer is None:
@@ -477,16 +489,30 @@ def optimizer_context(
 ) -> OptimizerContext:
     """Create or return the global OptimizerContext.
 
-    If Mofka is not available (no group_file or import fails), returns a
-    no-op context so the app runs unchanged.
+    Returns a no-op context when no transport can serve it, so the app runs
+    unchanged.
+
+    THE GROUP FILE IS A MOFKA CONCEPT, NOT A PRECONDITION FOR ACTUATION.
+    This used to gate solely on `group_file`, which silently disabled the whole
+    actuation path under any other transport: the context logged
+    `no_group_file` and became a no-op BEFORE the streaming/transport selector
+    was ever consulted, so plans published to a shared-memory mailbox were
+    never read and knobs never moved. That is what made the first Option C
+    end-to-end run stop at "plan published" (see liveflow_shm/README.md).
+
+    Under LIVEFLOW_TRANSPORT the backend addresses topics by name and needs no
+    group file at all, so the gate has to be per transport.
     """
     global _global_context
     with _context_lock:
         if _global_context is not None:
             return _global_context
 
-        if not group_file or not os.path.exists(group_file):
-            logger.info("optimizer.context.no_group_file")
+        _transport = os.environ.get("LIVEFLOW_TRANSPORT", "mofka").strip().lower()
+        _needs_group_file = _transport == "mofka"
+
+        if _needs_group_file and (not group_file or not os.path.exists(group_file)):
+            logger.info("optimizer.context.no_group_file", transport=_transport)
             ctx = _NoopContext(namespace=namespace)
         else:
             ctx = OptimizerContext(
