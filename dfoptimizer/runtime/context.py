@@ -53,6 +53,11 @@ class OptimizerContext:
         # all now share.
         self._transport = os.environ.get("LIVEFLOW_TRANSPORT", "mofka").strip().lower()
         self._can_publish = bool(group_file) or self._transport != "mofka"
+        # Reconcile-to-desired-state rather than drain-a-queue. On by default for broadcast
+        # transports, where every rank reads the same slot and last-value-wins is the point;
+        # off under Mofka so existing behaviour is untouched. See desired_actions_for().
+        self._reconcile = os.environ.get(
+            "LIVEFLOW_RECONCILE", "1" if self._transport != "mofka" else "0") == "1"
         self.topic_plans = topic_plans
         self.topic_acks = topic_acks
         self.topic_registry = topic_registry
@@ -164,6 +169,45 @@ class OptimizerContext:
                     remaining[knob_id] = plan
             self._queues[func_name] = remaining
         return matched
+
+    def desired_actions_for(self, func_name: str, at: str = "epoch_boundary") -> List[ActionPlan]:
+        """Return the current DESIRED plans without consuming them.
+
+        RECONCILIATION, NOT DELIVERY. `drain_actions_for` removes a plan as it hands it over, so
+        each rank consumes independently at whatever moment it reaches a window boundary. With
+        more than one rank that is a divergence generator: if rank A drains at window 10 and rank
+        B at window 11 with a new plan published in between, the two ranks apply DIFFERENT values
+        and stay that way. That is the sec 78 rank-asymmetry failure re-created by timing instead
+        of by flags, and no amount of care in the actuator prevents it.
+
+        Holding the plan and letting every rank reconcile to it makes the apply idempotent and
+        convergent: whenever a rank next looks, it sees the same current value as every other
+        rank, regardless of when it looked. It also matches the hop-4 mailbox exactly, whose
+        semantics are last-value-wins because a knob is STATE, not an event stream.
+
+        LIMIT, stated because it decides where this is safe: reconciliation gives CONVERGENCE,
+        not SIMULTANEITY. Ranks agree eventually, not at the same instant. That is fine for a
+        knob whose apply is local (read_threads rebuilds one process's DataLoader). It is NOT
+        sufficient for a knob whose apply contains a collective -- `bucket_cap_mb` ->
+        `_rebuild_ddp` (sec 68) -- where a rank arriving a window late deadlocks the ones that
+        arrived on time. Those need a deterministic apply point carried in the plan, not just
+        convergence. Not implemented here; such knobs must keep using drain semantics until it is.
+        """
+        with self._lock:
+            pending = self._queues[func_name]
+            return [
+                plan for plan in pending.values()
+                if plan.apply_when == at or at == "epoch_boundary"
+            ]
+
+    def actions_for(self, func_name: str, at: str = "epoch_boundary") -> List[ActionPlan]:
+        """Reconcile when the transport is a broadcast one, drain otherwise.
+
+        Defaults to the historical drain behaviour under Mofka so existing runs are unchanged.
+        """
+        if self._reconcile:
+            return self.desired_actions_for(func_name, at)
+        return self.drain_actions_for(func_name, at)
 
     def ack_action(self, plan: ActionPlan, old_value, new_value, status="applied"):
         ack = ActionAck(

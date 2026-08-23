@@ -85,8 +85,11 @@ def tunable(knobs: Dict[str, dict]):
                 _register_knobs(wrapper, ctx, current_values=live_values)
 
             # Drain pending actions for this function
+            _reconciling = getattr(ctx, "_reconcile", False)
             namespace = ctx.namespace
-            actions = ctx.drain_actions_for(func_name, at=apply_at)
+            # Reconcile under a broadcast transport, drain under Mofka. See
+            # OptimizerContext.desired_actions_for for why draining diverges across ranks.
+            actions = ctx.actions_for(func_name, at=apply_at)
 
             applied = []
             for action in actions:
@@ -117,7 +120,21 @@ def tunable(knobs: Dict[str, dict]):
                 old_val = kwargs[param_name]
                 new_val = kdef.clamp(action.new_value)
                 kwargs[param_name] = new_val
-                applied.append((action, old_val, new_val))
+
+                # RE-ASSERT ALWAYS, ACK ONLY ON CHANGE.
+                #
+                # Under reconciliation the same desired value is seen at every boundary, so the
+                # override above has to run every time -- that is what makes a rank that joined
+                # late, or restarted, converge on the current value. But acking every time would
+                # be wrong twice over: it floods the ack path, and the cooldown/effectiveness
+                # gates key off acks (sec 83.5), so a stream of no-op acks would look like
+                # repeated successful actions and corrupt the very signal the gates need.
+                #
+                # An ack means "this knob moved", not "I looked at this knob".
+                if old_val != new_val:
+                    applied.append((action, old_val, new_val))
+                elif _reconciling:
+                    continue
 
                 logger.info(
                     "optimizer.tunable.override",
