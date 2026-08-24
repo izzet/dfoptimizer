@@ -37,6 +37,14 @@ def _make_planner():
         from .planner.clbo_planner import CLBOPlanner
         logger.info("optimizer.algo.selected", algo="clbo")
         return CLBOPlanner()
+    if algo == "cbandit":
+        # Cross-layer-directed coordinate bandit: argmax domain picks the knob, UCB over
+        # {stay, down, up} picks the value, probe cost discounts the exploration bonus.
+        # Built because CLBO's acquisition cannot return the incumbent and so pays cumulative
+        # regret every window; see cbandit_planner.py for the measurements.
+        from .planner.cbandit_planner import CoordinateBanditPlanner
+        logger.info("optimizer.algo.selected", algo="cbandit")
+        return CoordinateBanditPlanner()
     return Planner()
 
 _shutdown_requested = False
