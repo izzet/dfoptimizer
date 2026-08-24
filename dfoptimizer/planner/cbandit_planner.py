@@ -180,6 +180,19 @@ class CoordinateBanditPlanner:
         cands = self._neighbourhood(short, current)
         seen = [m for (s, _l), (n, m) in self._stats.items() if s == short and n > 0]
         optimistic = min(seen) if seen else 0.0
+        # PRIOR FOR AN UNTRIED ARM = the CURRENT arm's performance, not the best ever seen.
+        #
+        # Using the global best made every untried neighbour score below every measured arm, and
+        # because moves are LOCAL each move exposes a fresh untried neighbour -- so the planner
+        # walked forever. Measured on StorMer: 16 plans in a 240-step run at 1.479 s/step against
+        # the rules' 2 plans, which is the cumulative-regret failure this planner exists to avoid,
+        # reproduced by my own optimism term.
+        #
+        # A neighbouring level is a small perturbation of the current one, so the honest prior is
+        # "about the same as now"; the confidence radius, not a fabricated mean, is what should pay
+        # for exploring it.
+        cur_n, cur_mean = self._stats.get((short, current), (0, 0.0))
+        prior = cur_mean if cur_n > 0 else (optimistic if seen else 0.0)
         # The confidence radius is a FRACTION of the objective's scale. Written in absolute units
         # it would mean something different on a 1 s/step workload than on a 10 s/step one, and the
         # probe-cost term below (which is inherently relative) could never be commensurate with it.
@@ -187,9 +200,11 @@ class CoordinateBanditPlanner:
         best, best_score = current, float("inf")
         detail = []
         for lv in cands:
-            n, mean = self._stats.get((short, lv), (0, optimistic))
-            bonus = (self._c * scale * math.sqrt(math.log(max(self._total_pulls, 2)) / n)
-                     if n > 0 else self._c * scale * 2.0)
+            n, mean = self._stats.get((short, lv), (0, prior))
+            # An untried arm is treated as one pull's worth of uncertainty, not as unboundedly
+            # promising. With the prior above this makes exploration decay as evidence accumulates
+            # instead of persisting forever.
+            bonus = self._c * scale * math.sqrt(math.log(max(self._total_pulls, 2)) / max(n, 1))
             # Cost of CHANGING to this arm. Staying is free by construction, which is what makes
             # exploitation reachable without a separate budget.
             cost = 0.0 if lv == current else self._cost_w * _PROBE_COST.get(domain, 0.03) * scale
