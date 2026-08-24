@@ -398,6 +398,20 @@ class OptimizerContext:
             knob_id=plan.knob_id,
             new_value=plan.new_value,
             target_nodes=plan.target_nodes or "all",
+            # WHY the plan exists, logged where it ARRIVES.
+            #
+            # The rationale names the finding that produced the plan ("decode_pressure: ...
+            # -> decode_parallelism"), which is the only record of WHICH DOMAIN the controller
+            # attributed the problem to. It was previously visible only if the application's own
+            # apply path happened to print it: DLIO's did, StorMer's did not, so the phase 29
+            # bottleneck-shift result could show that two domains were actuated but had to INFER
+            # from the knob-to-tag mapping which rule drove each.
+            #
+            # The planner logs it too (planner.py:152) but that is the agent process, and no agent
+            # log in this campaign has ever captured those records. Logging it on arrival makes
+            # domain attribution observable from the application side, for any application,
+            # independent of how it applies the knob.
+            rationale=plan.rationale,
         )
 
         with self._lock:
