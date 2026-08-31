@@ -338,6 +338,10 @@ class Planner:
                     continue
 
             responses = self._responses_by_tag.get(tag, [])
+            # Survivors of the gates, to be RANKED before any is fired. Collecting rather than
+            # planning inline is the whole change: which knob to move is a cost decision and cannot
+            # be made one knob at a time.
+            candidates = []
             logger.debug(
                 "planner.tag.resolve",
                 tag=tag,
@@ -402,10 +406,46 @@ class Planner:
                     )
                     continue
 
-                # Compute new value
-                plan = self._make_plan(knob_id, response, finding, severity_score, tag, node=node)
-                if plan is not None:
-                    plans.append(plan)
+                # Passed every gate; ranking happens below.
+                candidates.append((knob_id, response))
+
+            # ---- COST-AWARE SELECTION -------------------------------------------------------
+            # Previously every knob that responded to a tag was planned. That is sound only while
+            # actions are free and reversible -- the assumption every DL input-pipeline tuner makes,
+            # and the one our measurements break: a loader rebuild is 0.21 s, staging a shard is
+            # 465-1365 s and cannot be undone, `lfs migrate` is 4.4 h. Firing all of them together
+            # is not a policy.
+            #
+            # Rule: fire only the CHEAPEST tier. Costlier candidates are deferred, not discarded --
+            # if the cheap knob fails to help, its cooldown/effectiveness gate stops it re-firing on
+            # the next window and the expensive one becomes the cheapest survivor then. Escalation
+            # therefore falls out of the existing gates rather than needing new machinery.
+            #
+            # With every cost at its 0.0 default the tier contains everything and behaviour is
+            # exactly as before, so this cannot regress knobs declared without a cost.
+            if candidates:
+                def _cost(knob_id):
+                    kd = self.knobs.get(knob_id)
+                    return float(getattr(kd, "cost_seconds", 0.0) or 0.0) if kd else 0.0
+
+                cheapest = min(_cost(k) for k, _ in candidates)
+                tier = [(k, r) for k, r in candidates if _cost(k) <= cheapest]
+                deferred = [(k, r) for k, r in candidates if _cost(k) > cheapest]
+
+                for knob_id, _r in deferred:
+                    logger.info(
+                        "optimizer.gate.deferred",
+                        knob_id=knob_id, tag=tag, gate="cost",
+                        cost_seconds=_cost(knob_id),
+                        cheaper_first=[k for k, _ in tier],
+                        reason="a cheaper actuator for this tag has not yet been tried",
+                    )
+
+                for knob_id, response in tier:
+                    plan = self._make_plan(knob_id, response, finding, severity_score, tag,
+                                           node=node)
+                    if plan is not None:
+                        plans.append(plan)
 
         return plans
 

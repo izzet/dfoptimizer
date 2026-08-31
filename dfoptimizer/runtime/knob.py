@@ -10,6 +10,7 @@ def knob(
     values: Optional[List[Any]] = None,
     scope: str = "job",
     responds_to: Optional[Dict[str, dict]] = None,
+    cost_seconds: float = 0.0,
 ) -> dict:
     """Helper to declare a knob in @tunable.
 
@@ -30,6 +31,7 @@ def knob(
         "values": values,
         "scope": scope,
         "responds_to": responds_to or {},
+        "cost_seconds": cost_seconds,
     }
 
 
@@ -56,6 +58,7 @@ def knob_def_from_dict(knob_id: str, d: dict, target_function: str = "") -> Knob
         range=d.get("range"),
         values=d.get("values"),
         scope=d.get("scope", "job"),
+        cost_seconds=float(d.get("cost_seconds", 0.0) or 0.0),
         responds_to=responds_to,
         target_function=target_function,
     )
@@ -86,6 +89,7 @@ def knob_def_to_wire(kdef: KnobDef) -> dict:
         "scope": kdef.scope,
         "responds_to": responds_wire,
         "target_function": kdef.target_function,
+        "cost_seconds": kdef.cost_seconds,
     }
 
 
@@ -115,6 +119,7 @@ def knob_def_from_wire(d: dict) -> KnobDef:
         range=tuple(d["range"]) if d.get("range") else None,
         values=d.get("values"),
         scope=d.get("scope", "job"),
+        cost_seconds=float(d.get("cost_seconds", 0.0) or 0.0),
         responds_to=responds_to,
         target_function=d.get("target_function", ""),
     )

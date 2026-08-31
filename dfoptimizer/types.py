@@ -113,6 +113,16 @@ class KnobDef:
     range: Optional[tuple] = None  # (min, max) for numeric
     values: Optional[List[Any]] = None  # for enum-like knobs
     scope: str = "job"  # "job", "rank_local", "node"
+
+    # SECONDS TO APPLY THIS KNOB. Default 0.0 -- every knob declared before this existed is free and
+    # reversible, which is exactly the assumption every DL input-pipeline tuner makes, and why none
+    # of them needs a cost model. Measured here: a loader rebuild is 0.21 s, staging a shard is
+    # 465-1365 s, `lfs migrate` is 4.4 h. When actions differ by seven orders of magnitude, firing
+    # every knob that matches a tag is not a policy.
+    #
+    # The planner uses this to rank candidates cheapest-first. With all costs at the default the
+    # ranking is a no-op and behaviour is unchanged, so this cannot regress existing knobs.
+    cost_seconds: float = 0.0
     responds_to: Dict[str, KnobResponse] = dc.field(default_factory=dict)
     target_function: str = ""  # which @tunable function owns this knob
 
