@@ -122,7 +122,25 @@ class KnobDef:
     #
     # The planner uses this to rank candidates cheapest-first. With all costs at the default the
     # ranking is a no-op and behaviour is unchanged, so this cannot regress existing knobs.
-    cost_seconds: float = 0.0
+    # float, OR a dict keyed by VALUE. Cost is a property of what you are asking for, not of the
+    # knob: data_source="pfs" costs nothing, "local" costs 465-1365 s, "restriped" costs ~4.4 h.
+    # Collapsing those into one number per knob makes the expensive value look cheap or the cheap
+    # value look expensive, and either way the ranking is wrong.
+    cost_seconds: Any = 0.0
+
+    def cost_for(self, value=None) -> float:
+        """Cost of moving this knob TO `value`.
+
+        With no value the MAXIMUM is returned. That is deliberate: when the planner cannot yet tell
+        which value a response will produce, the safe assumption for an expensive knob is the worst
+        case, so it defers rather than fires on an optimistic guess.
+        """
+        c = self.cost_seconds
+        if isinstance(c, dict):
+            if value is None:
+                return float(max(c.values())) if c else 0.0
+            return float(c.get(value, max(c.values()) if c else 0.0))
+        return float(c or 0.0)
     responds_to: Dict[str, KnobResponse] = dc.field(default_factory=dict)
     target_function: str = ""  # which @tunable function owns this knob
 

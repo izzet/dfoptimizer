@@ -424,19 +424,27 @@ class Planner:
             # With every cost at its 0.0 default the tier contains everything and behaviour is
             # exactly as before, so this cannot regress knobs declared without a cost.
             if candidates:
-                def _cost(knob_id):
+                def _cost(knob_id, response=None):
                     kd = self.knobs.get(knob_id)
-                    return float(getattr(kd, "cost_seconds", 0.0) or 0.0) if kd else 0.0
+                    if kd is None:
+                        return 0.0
+                    # Cost belongs to the VALUE being asked for. A "set" response names it, so the
+                    # exact cost is knowable; otherwise fall back to the knob's worst case, which
+                    # makes an expensive knob defer rather than fire on an optimistic guess.
+                    want = getattr(response, "set_to", None) if response is not None else None
+                    if hasattr(kd, "cost_for"):
+                        return kd.cost_for(want)
+                    return float(getattr(kd, "cost_seconds", 0.0) or 0.0)
 
-                cheapest = min(_cost(k) for k, _ in candidates)
-                tier = [(k, r) for k, r in candidates if _cost(k) <= cheapest]
-                deferred = [(k, r) for k, r in candidates if _cost(k) > cheapest]
+                cheapest = min(_cost(k, r) for k, r in candidates)
+                tier = [(k, r) for k, r in candidates if _cost(k, r) <= cheapest]
+                deferred = [(k, r) for k, r in candidates if _cost(k, r) > cheapest]
 
                 for knob_id, _r in deferred:
                     logger.info(
                         "optimizer.gate.deferred",
                         knob_id=knob_id, tag=tag, gate="cost",
-                        cost_seconds=_cost(knob_id),
+                        cost_seconds=_cost(knob_id, _r),
                         cheaper_first=[k for k, _ in tier],
                         reason="a cheaper actuator for this tag has not yet been tried",
                     )

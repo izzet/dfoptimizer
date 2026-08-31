@@ -3,6 +3,17 @@ from typing import Any, Dict, List, Optional
 from ..types import ActionDef, KnobDef, KnobResponse
 
 
+def _coerce_cost(c):
+    """cost_seconds may be a scalar OR a per-value mapping; preserve whichever was declared.
+
+    Coercing unconditionally with float() raised TypeError on the dict form, which is the form that
+    matters: cost belongs to the VALUE asked for, not to the knob.
+    """
+    if isinstance(c, dict):
+        return {k: float(v) for k, v in c.items()}
+    return float(c or 0.0)
+
+
 def knob(
     default: Any,
     type: type = int,
@@ -58,7 +69,7 @@ def knob_def_from_dict(knob_id: str, d: dict, target_function: str = "") -> Knob
         range=d.get("range"),
         values=d.get("values"),
         scope=d.get("scope", "job"),
-        cost_seconds=float(d.get("cost_seconds", 0.0) or 0.0),
+        cost_seconds=_coerce_cost(d.get("cost_seconds", 0.0)),
         responds_to=responds_to,
         target_function=target_function,
     )
@@ -119,7 +130,7 @@ def knob_def_from_wire(d: dict) -> KnobDef:
         range=tuple(d["range"]) if d.get("range") else None,
         values=d.get("values"),
         scope=d.get("scope", "job"),
-        cost_seconds=float(d.get("cost_seconds", 0.0) or 0.0),
+        cost_seconds=_coerce_cost(d.get("cost_seconds", 0.0)),
         responds_to=responds_to,
         target_function=d.get("target_function", ""),
     )
