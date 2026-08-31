@@ -1,6 +1,6 @@
 from typing import Any, Dict, List, Optional
 
-from ..types import KnobDef, KnobResponse
+from ..types import ActionDef, KnobDef, KnobResponse
 
 
 def knob(
@@ -117,4 +117,57 @@ def knob_def_from_wire(d: dict) -> KnobDef:
         scope=d.get("scope", "job"),
         responds_to=responds_to,
         target_function=d.get("target_function", ""),
+    )
+
+
+def action(
+    values: List[Any],
+    target_domain: str = "storage",
+    reversible: bool = True,
+    abortable: bool = False,
+    scope: str = "node",
+    cost_fn=None,
+    precondition_fn=None,
+    effect_fn=None,
+    reconcile_fn=None,
+) -> dict:
+    """Declare a COSTED actuator, the non-degenerate sibling of knob().
+
+    knob() describes something free and reversible -- set an argument, change your mind next window.
+    Every actuator in the DL input-tuner literature is of that kind, which is why none of those
+    systems carries a cost model. action() describes the rest:
+
+        staging   465-1365 s   abortable during, not undoable after
+        restripe  4.4 h        neither
+
+    `cost_fn` is a FUNCTION because the cost is not stable -- stage-in varied 2.9x for byte-identical
+    work, which is the difference between a 1.23- and a 3.61-epoch break-even.
+    """
+    return {
+        "kind": "action",
+        "values": values,
+        "target_domain": target_domain,
+        "reversible": reversible,
+        "abortable": abortable,
+        "scope": scope,
+        "cost_fn": cost_fn,
+        "precondition_fn": precondition_fn,
+        "effect_fn": effect_fn,
+        "reconcile_fn": reconcile_fn,
+    }
+
+
+def action_def_from_dict(action_id: str, d: dict, target_function: str = "") -> ActionDef:
+    return ActionDef(
+        id=action_id,
+        values=d.get("values", []),
+        target_domain=d.get("target_domain", "storage"),
+        reversible=d.get("reversible", True),
+        abortable=d.get("abortable", False),
+        scope=d.get("scope", "node"),
+        cost_fn=d.get("cost_fn"),
+        precondition_fn=d.get("precondition_fn"),
+        effect_fn=d.get("effect_fn"),
+        reconcile_fn=d.get("reconcile_fn"),
+        target_function=target_function,
     )

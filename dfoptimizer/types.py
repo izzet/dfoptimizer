@@ -18,6 +18,65 @@ class KnobResponse:
 
 
 @dc.dataclass
+class ActionDef:
+    """An actuator that may COST something, may be IRREVERSIBLE, and may have a PRECONDITION.
+
+    `KnobDef` is the degenerate case of this: cost ~= the loader rebuild (measured 0.21 s on the TF
+    path), reversible, precondition = a range check, and the "side effect" is assigning a function
+    argument. Every actuator in the DL-input-tuner literature (AUTOTUNE, Cachew, Pecan, cedar,
+    Plumber) is degenerate in exactly that way, which is why none of them carries a cost model.
+
+    Non-degenerate actuators break the assumption those systems are built on:
+
+        read/decode threads, prefetch   0.21 s      reversible
+        staging to node-local storage   465-1365 s  abortable during, not undoable after
+        restripe (`lfs migrate`)        4.4 h       not reversible
+
+    Costs are functions, not constants, because they are NOT stable: stage-in was measured at
+    465, 474, 477, 679, 1181 and 1365 s for byte-identical work (2.9x). With R1's 378 s/epoch gain
+    that is the difference between a break-even of 1.23 and 3.61 epochs, so a precomputed threshold
+    is wrong at one end or the other.
+
+    `cost_fn`, `precondition_fn` and `effect_fn` take (observation, value); `reconcile_fn` takes the
+    desired value and performs the side effect on the rank that owns it.
+    """
+
+    id: str  # e.g. "dlio.data_source"
+    values: List[Any]  # desired states, e.g. ["pfs", "local"]
+    target_domain: str = "storage"  # storage | decode | comm | compute | transfer
+    reversible: bool = True
+    abortable: bool = False  # can be given up part-way, paying only the work already done
+    scope: str = "node"
+    cost_fn: Optional[Any] = None
+    precondition_fn: Optional[Any] = None
+    effect_fn: Optional[Any] = None
+    reconcile_fn: Optional[Any] = None
+    target_function: str = ""
+
+    def cost(self, obs, value) -> float:
+        return 0.0 if self.cost_fn is None else float(self.cost_fn(obs, value))
+
+    def precondition(self, obs, value):
+        return (True, "") if self.precondition_fn is None else self.precondition_fn(obs, value)
+
+    @staticmethod
+    def from_knob(kdef: "KnobDef", rebuild_seconds: float = 0.21) -> "ActionDef":
+        """Wrap an existing knob so old declarations keep working and gain honest cost fields."""
+        return ActionDef(
+            id=kdef.id,
+            values=list(kdef.values) if kdef.values else [],
+            target_domain="storage",
+            reversible=True,
+            abortable=True,
+            scope=kdef.scope,
+            cost_fn=lambda _o, _v, c=rebuild_seconds: c,
+            precondition_fn=lambda _o, v, k=kdef: (k.clamp(v) == v,
+                                                  "" if k.clamp(v) == v else "outside knob range"),
+            target_function=kdef.target_function,
+        )
+
+
+@dc.dataclass
 class KnobDef:
     """Definition of a tunable knob."""
 
