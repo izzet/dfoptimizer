@@ -47,6 +47,33 @@ class ActionDef:
     reversible: bool = True
     abortable: bool = False  # can be given up part-way, paying only the work already done
     scope: str = "node"
+
+    # MUST every rank apply this in the SAME window, or none?
+    #
+    # This is NOT a precondition. A precondition asks "may I?" and is evaluated per node; its failure
+    # is a declined action. Unanimity asks "must everyone, simultaneously?" and its failure is a
+    # HANG -- no error, no timeout, nothing in the log.
+    #
+    # Raised by the Tuolumne branch from a root cause they already paid for: `halo_width` sets how
+    # many boundary planes are exchanged, so it changes the P2P message size, and their `_tune_*_live`
+    # enable flags were set only on optimizer-context ranks. Collective actuators therefore ran on
+    # 4 of 16 ranks and the job hung. `halo3d_train.py:447` still carries the scar comment.
+    #
+    # Our staging action independently needed the same mechanism (allreduce(min) veto,
+    # allreduce(max) bail) but special-cased it. Declaring it makes `halo_width` and `staging` the
+    # same kind of object, which is the point of the generalisation.
+    #
+    # NOTE the axes are independent: `comm_overlap` is free, reversible AND unanimity-free (it
+    # reschedules the same ops, so disagreeing ranks skew rather than deadlock), while `halo_width`
+    # is free and reversible but REQUIRES unanimity. Cost does not predict it.
+    requires_unanimity: bool = False
+
+    # For actuators that touch the math. `comm_overlap` was verified numerically identical to the
+    # blocking path at 4.3e-07 relative max difference, making it a scheduling change rather than a
+    # model change. `amp` (bf16) genuinely changes numerics and cannot claim this. An actuator that
+    # silently changes the computation is not an actuator, so anything touching the math carries
+    # either a verified bound here or an explicit note that it changes results.
+    equivalence_verified: Optional[float] = None
     cost_fn: Optional[Any] = None
     precondition_fn: Optional[Any] = None
     effect_fn: Optional[Any] = None
