@@ -277,6 +277,22 @@ class Planner:
         if is_global_scope and not suppresses_tags:
             self._clear_suppressions_for(finding.finding_type)
 
+        # Survivors of the gates, to be RANKED before any is fired, collected ACROSS EVERY TAG of
+        # this finding rather than per tag.
+        #
+        # This list used to be reset inside the tag loop, which quietly defeated the whole
+        # cost-ranking rule. A finding's tags are ALTERNATIVE responses to ONE observation -- our
+        # reader_data_headroom carries reader_parallelism, dataloader_prefetch and storage_starved
+        # -- and each maps to exactly one knob. Ranking within a tag therefore compared a knob only
+        # against itself: it was always its own cheapest tier, `deferred` was always empty, and all
+        # three fired together. Measured: read_threads (0.206 s), prefetch_size (0.206 s) AND
+        # data_source (465 s) all planned and applied in the same window, with no
+        # optimizer.gate.deferred ever logged.
+        #
+        # The comment below already said which knob to move "cannot be made one knob at a time".
+        # It was still being made one TAG at a time, which for these rules is the same thing.
+        candidates = []
+
         for tag in finding.opportunity_tags:
             # Data-driven suppression: check if this tag is actively
             # suppressed by a global finding.
@@ -338,10 +354,6 @@ class Planner:
                     continue
 
             responses = self._responses_by_tag.get(tag, [])
-            # Survivors of the gates, to be RANKED before any is fired. Collecting rather than
-            # planning inline is the whole change: which knob to move is a cost decision and cannot
-            # be made one knob at a time.
-            candidates = []
             logger.debug(
                 "planner.tag.resolve",
                 tag=tag,
@@ -406,54 +418,60 @@ class Planner:
                     )
                     continue
 
-                # Passed every gate; ranking happens below.
-                candidates.append((knob_id, response))
+                # Passed every gate; ranking happens after ALL tags are collected. The tag is
+                # carried because _make_plan needs it and because the deferral log should name
+                # which opportunity the deferred knob was answering.
+                if any(existing == knob_id for existing, _, _ in candidates):
+                    # Same knob reachable from two tags. Keep the first: firing it twice in one
+                    # window would double-count its cost and race its own cooldown.
+                    continue
+                candidates.append((knob_id, response, tag))
 
-            # ---- COST-AWARE SELECTION -------------------------------------------------------
-            # Previously every knob that responded to a tag was planned. That is sound only while
-            # actions are free and reversible -- the assumption every DL input-pipeline tuner makes,
-            # and the one our measurements break: a loader rebuild is 0.21 s, staging a shard is
-            # 465-1365 s and cannot be undone, `lfs migrate` is 4.4 h. Firing all of them together
-            # is not a policy.
-            #
-            # Rule: fire only the CHEAPEST tier. Costlier candidates are deferred, not discarded --
-            # if the cheap knob fails to help, its cooldown/effectiveness gate stops it re-firing on
-            # the next window and the expensive one becomes the cheapest survivor then. Escalation
-            # therefore falls out of the existing gates rather than needing new machinery.
-            #
-            # With every cost at its 0.0 default the tier contains everything and behaviour is
-            # exactly as before, so this cannot regress knobs declared without a cost.
-            if candidates:
-                def _cost(knob_id, response=None):
-                    kd = self.knobs.get(knob_id)
-                    if kd is None:
-                        return 0.0
-                    # Cost belongs to the VALUE being asked for. A "set" response names it, so the
-                    # exact cost is knowable; otherwise fall back to the knob's worst case, which
-                    # makes an expensive knob defer rather than fire on an optimistic guess.
-                    want = getattr(response, "set_to", None) if response is not None else None
-                    if hasattr(kd, "cost_for"):
-                        return kd.cost_for(want)
-                    return float(getattr(kd, "cost_seconds", 0.0) or 0.0)
+        # ---- COST-AWARE SELECTION (once per FINDING, across every tag) ----------------------
+        # Previously every knob that responded to a tag was planned. That is sound only while
+        # actions are free and reversible -- the assumption every DL input-pipeline tuner makes,
+        # and the one our measurements break: a loader rebuild is 0.21 s, staging a shard is
+        # 465-1365 s and cannot be undone, `lfs migrate` is 4.4 h. Firing all of them together
+        # is not a policy.
+        #
+        # Rule: fire only the CHEAPEST tier. Costlier candidates are deferred, not discarded --
+        # if the cheap knob fails to help, its cooldown/effectiveness gate stops it re-firing on
+        # the next window and the expensive one becomes the cheapest survivor then. Escalation
+        # therefore falls out of the existing gates rather than needing new machinery.
+        #
+        # With every cost at its 0.0 default the tier contains everything and behaviour is
+        # exactly as before, so this cannot regress knobs declared without a cost.
+        if candidates:
+            def _cost(knob_id, response=None):
+                kd = self.knobs.get(knob_id)
+                if kd is None:
+                    return 0.0
+                # Cost belongs to the VALUE being asked for. A "set" response names it, so the
+                # exact cost is knowable; otherwise fall back to the knob's worst case, which
+                # makes an expensive knob defer rather than fire on an optimistic guess.
+                want = getattr(response, "set_to", None) if response is not None else None
+                if hasattr(kd, "cost_for"):
+                    return kd.cost_for(want)
+                return float(getattr(kd, "cost_seconds", 0.0) or 0.0)
 
-                cheapest = min(_cost(k, r) for k, r in candidates)
-                tier = [(k, r) for k, r in candidates if _cost(k, r) <= cheapest]
-                deferred = [(k, r) for k, r in candidates if _cost(k, r) > cheapest]
+            cheapest = min(_cost(k, r) for k, r, _t in candidates)
+            tier = [(k, r, t) for k, r, t in candidates if _cost(k, r) <= cheapest]
+            deferred = [(k, r, t) for k, r, t in candidates if _cost(k, r) > cheapest]
 
-                for knob_id, _r in deferred:
-                    logger.info(
-                        "optimizer.gate.deferred",
-                        knob_id=knob_id, tag=tag, gate="cost",
-                        cost_seconds=_cost(knob_id, _r),
-                        cheaper_first=[k for k, _ in tier],
-                        reason="a cheaper actuator for this tag has not yet been tried",
-                    )
+            for knob_id, _r, _tag in deferred:
+                logger.info(
+                    "optimizer.gate.deferred",
+                    knob_id=knob_id, tag=_tag, gate="cost",
+                    cost_seconds=_cost(knob_id, _r),
+                    cheaper_first=[k for k, _, _ in tier],
+                    reason="a cheaper actuator for this finding has not yet been tried",
+                )
 
-                for knob_id, response in tier:
-                    plan = self._make_plan(knob_id, response, finding, severity_score, tag,
-                                           node=node)
-                    if plan is not None:
-                        plans.append(plan)
+            for knob_id, response, _tag in tier:
+                plan = self._make_plan(knob_id, response, finding, severity_score, _tag,
+                                       node=node)
+                if plan is not None:
+                    plans.append(plan)
 
         return plans
 
