@@ -66,7 +66,7 @@ import structlog
 
 from ..types import ActionPlan, DiagnosisFindingMsg, KnobDef
 from .clbo import accept_decision
-from .clbo_planner import _domain_of, _levels_for
+from .clbo_planner import _domain_of, _levels_for, domains_from_metrics
 
 logger = structlog.get_logger()
 
@@ -143,16 +143,11 @@ class CoordinateBanditPlanner:
         wall = m.get("active_time")
         if wall is None or wall <= 0:
             return None
-        fetch = m.get("fetch_iter_time_proc_max", 0.0)
-        comm = m.get("comm_time_proc_max", 0.0)
-        domains = {
-            # Same decomposition CLBOPlanner uses, so the two planners see identical signal
-            # and any difference between them is the SEARCH, not the observation.
-            "input": m.get("reader_posix_time_proc_max", fetch),
-            "decode": m.get("reader_decode_time_proc_max", 0.0),
-            "comm": comm,
-            "compute": max(m.get("compute_time_proc_max", 0.0) - comm, 0.0),
-        }
+        # ONE shared definition, so the two planners cannot drift and any difference between them
+        # is the SEARCH, not the observation. Both used to build this inline and both had the same
+        # bug: reader_posix as the domain time instead of the exposed fetch. See
+        # clbo_planner.domains_from_metrics.
+        domains = domains_from_metrics(m)
         # THE PART OF THE STEP WE CANNOT NAME.
         #
         # The domain times above do not have to add up to the wall, and on DLIO they badly do not:

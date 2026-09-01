@@ -52,6 +52,50 @@ def _domain_of(knob_short: str) -> str:
     return _DOMAIN_OF.get(knob_short, "compute")
 
 
+
+def domains_from_metrics(m: Dict[str, float]) -> Dict[str, float]:
+    """Per-domain times for one window. THE single definition, shared by both planners.
+
+    input = fetch - decode, NOT reader_posix. This is the documented decomposition
+    (AnalyzerPresetConfigStormerXLayer):
+
+        decode  = reader_decode_time_proc_max          (explicit region)
+        input   = fetch_iter_time_proc_max - decode    (the remainder: queueing + raw chunk I/O)
+        comm    = comm_time_proc_max
+
+    Both planners had it inverted -- `reader_posix_time_proc_max` as the primary with `fetch` only
+    as a fallback -- and the same preset docstring says why that cannot work:
+
+        "syscall interception ... does NOT reliably reach forked DataLoader workers: measured, a
+         workers=1 run yields 130 reader_posix-scoped findings while workers=8 runs yield ZERO
+         (the fork gap) ... reader_posix is left defined and still used OPPORTUNISTICALLY when it
+         IS populated."
+
+    An opportunistic metric was being used as the load-bearing one. Measured on DLIO at 1 node:
+
+        as coded      input=0.6064  compute=2.5443  sum=3.1507  vs wall 6.1725  -> 49% unexplained
+        as documented input=3.6282  compute=2.5443  sum=6.1725  vs wall 6.1725  -> closes exactly
+
+    So the planner compared a storage sub-component (0.61) against compute (2.54), concluded
+    compute dominates, and never touched the input domain that actually held 3.63 s of the step.
+
+    fetch is the EXPOSED input cost measured parent-side (how long next(loader) blocks), which is
+    the quantity a critical-path decision needs. reader_posix explains what the storage part of
+    that cost was doing and is kept for choosing WHICH knob to move inside the input domain -- it
+    is a within-domain diagnostic, not a domain time.
+    """
+    fetch = float(m.get("fetch_iter_time_proc_max", 0.0) or 0.0)
+    decode = float(m.get("reader_decode_time_proc_max", 0.0) or 0.0)
+    comm = float(m.get("comm_time_proc_max", 0.0) or 0.0)
+    compute = float(m.get("compute_time_proc_max", 0.0) or 0.0)
+    return {
+        "input": max(fetch - decode, 0.0),
+        "decode": decode,
+        "comm": comm,
+        "compute": max(compute - comm, 0.0),
+    }
+
+
 def _levels_for(kdef: KnobDef, current) -> List:
     """Candidate values for a knob: explicit enum values, else a small grid over the range."""
     if kdef.values:
@@ -130,18 +174,9 @@ class CLBOPlanner:
         wall = m.get("active_time")
         if wall is None or wall <= 0:
             return None
-        fetch = m.get("fetch_iter_time_proc_max", 0.0)
-        # THREE-WAY: split the input pole into STORAGE (POSIX read) and DECODE (app region). The
-        # analyzer emits storage_time/decode_time when present; else this is a two-domain workload
-        # and "input" stays the whole fetch (storage fallback = fetch, decode = 0) -> DLIO/stormer
-        # unchanged (their surrogate models only {input,comm,compute}, ignoring the extra decode key).
-        storage = m.get("reader_posix_time_proc_max", fetch)   # POSIX read = STORAGE domain
-        decode = m.get("reader_decode_time_proc_max", 0.0)     # data.decode = DECODE domain
-        comm = m.get("comm_time_proc_max", 0.0)
-        pure_compute = max(m.get("compute_time_proc_max", 0.0) - comm, 0.0)
         cfg = self._planned_cfg.get(window, self._default_short)
         return {"cfg": dict(cfg),
-                "domains": {"input": storage, "decode": decode, "comm": comm, "compute": pure_compute},
+                "domains": domains_from_metrics(m),
                 "wall": float(wall)}
 
     # --- Planner-compatible decision entry ---
