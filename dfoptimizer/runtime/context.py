@@ -367,6 +367,17 @@ class OptimizerContext:
 
         msg = json.loads(payload.decode("utf-8"))
 
+        # A window's plans arrive as ONE batch message, because the broadcast mailbox is a single
+        # versioned slot and per-plan publishes overwrite each other (see optimizer._publish_plans).
+        # A bare plan dict is still accepted: other transports are real queues and older publishers
+        # send that shape, and silently ignoring them would be the same class of bug again.
+        if isinstance(msg, dict) and isinstance(msg.get("plans"), list):
+            for sub in msg["plans"]:
+                self._handle_plan_message(sub)
+            return
+        self._handle_plan_message(msg)
+
+    def _handle_plan_message(self, msg):
         plan = ActionPlan(
             plan_id=msg["plan_id"],
             knob_id=msg["knob_id"],

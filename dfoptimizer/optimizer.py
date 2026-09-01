@@ -398,9 +398,11 @@ class Optimizer:
                         finding = self._parse_finding(event)
                         if finding is not None:
                             plans = self.planner.process_finding(finding)
-                            for plan in plans:
-                                self._publish_plan(producer, plan)
-                                plan_count += 1
+                            # ONE message for the whole window, not one per plan. See
+                            # _publish_plans: the mailbox is a single slot and per-plan
+                            # publishes overwrite each other.
+                            self._publish_plans(producer, plans)
+                            plan_count += len(plans)
                     except Exception:
                         error_count += 1
                         logger.exception("optimizer.event.error", event_index=event_count)
@@ -642,18 +644,52 @@ class Optimizer:
             key_metrics=msg.get("key_metrics", {}),
         )
 
-    def _publish_plan(self, producer, plan: ActionPlan):
-        payload = json.dumps(dataclasses.asdict(plan)).encode("utf-8")
+    def _publish_plans(self, producer, plans):
+        """Publish a window's plans as ONE message.
+
+        One message per plan loses all but the last under the broadcast-mailbox transport, which is
+        a single versioned SLOT rather than a queue (shm_mailbox.ShmMailbox, "One versioned
+        broadcast slot"). Three plans pushed back to back overwrite one another and the application
+        polls once, so it sees only whichever was published last.
+
+        Measured: window 0 published read_threads 1->2, prefetch_size 1->2 and data_source
+        pfs->local, and the app logged plan_received for data_source ALONE. The knobs never moved.
+
+        The single-slot semantic is right for ONE knob -- a reader that was paused wants the current
+        value, not a queue of superseded ones -- but wrong across DISTINCT knobs, because
+        read_threads=2 is not superseded by data_source=local. They are independent state. Sending
+        the window's whole desired state in one message is what the mailbox docstring already says
+        plans ARE: state, not events. The receiver keys them per knob (context._queues), so
+        latest-wins is preserved exactly as before.
+        """
+        plans = list(plans)
+        if not plans:
+            return
+        payload = json.dumps(
+            {"type": "action_plan_batch",
+             "plans": [dataclasses.asdict(p) for p in plans]}
+        ).encode("utf-8")
         metadata = {
-            "type": "action_plan",
-            "plan_id": plan.plan_id,
-            "knob_id": plan.knob_id,
-            "target_function": plan.target_function,
+            "type": "action_plan_batch",
+            "plan_count": len(plans),
+            "knob_ids": [p.knob_id for p in plans],
+            "target_function": plans[0].target_function,
         }
-        if plan.target_nodes:
-            metadata["target_nodes"] = plan.target_nodes
+        # target_nodes is per-plan and the receiver filters on the plan body, so the metadata copy
+        # is advisory only. Carry it when every plan agrees, which is the case the agent produces.
+        node_sets = {tuple(p.target_nodes or ()) for p in plans}
+        if len(node_sets) == 1 and plans[0].target_nodes:
+            metadata["target_nodes"] = plans[0].target_nodes
         for _ in range(self._plan_fanout):
             producer.push(metadata=metadata, data=payload)
+        for plan in plans:
+            self._log_published(plan)
+            self._plans_produced += 1
+
+    def _publish_plan(self, producer, plan: ActionPlan):
+        self._publish_plans(producer, [plan])
+
+    def _log_published(self, plan: ActionPlan):
         logger.info(
             "optimizer.plan.published",
             plan_id=plan.plan_id,
@@ -665,4 +701,3 @@ class Optimizer:
             fanout=self._plan_fanout,
             rationale=plan.rationale,
         )
-        self._plans_produced += 1
