@@ -59,11 +59,13 @@ from __future__ import annotations
 import math
 import os
 import uuid
-from typing import Dict, List, Optional, Tuple
+from collections import deque
+from typing import Deque, Dict, List, Optional, Tuple
 
 import structlog
 
 from ..types import ActionPlan, DiagnosisFindingMsg, KnobDef
+from .clbo import accept_decision
 from .clbo_planner import _domain_of, _levels_for
 
 logger = structlog.get_logger()
@@ -87,6 +89,11 @@ class CoordinateBanditPlanner:
         self._levels: Dict[str, List] = {}
         # Bandit statistics per (knob_short, level): pulls and mean observed wall.
         self._stats: Dict[Tuple[str, object], Tuple[int, float]] = {}
+        # Recent wall samples per arm. The running mean above is enough to RANK arms, but not to
+        # ask whether two arms differ at all, which needs a spread. Bounded because recency is what
+        # matters under drift, and because an unbounded history would let a stale regime outvote
+        # the current one.
+        self._samples: Dict[Tuple[str, object], Deque[float]] = {}
         self._cur_window: int = -1
         self._win_metrics: Dict[str, float] = {}
         self._planned_cfg: Dict[int, dict] = {}
@@ -95,6 +102,15 @@ class CoordinateBanditPlanner:
         self._c = float(os.environ.get("DFOPTIMIZER_CBANDIT_C", "0.35"))
         # Set to 0 to disable cost weighting and isolate its contribution.
         self._cost_w = float(os.environ.get("DFOPTIMIZER_CBANDIT_COST_W", "1.0"))
+        # ACCEPTANCE TEST (clbo.accept_decision). See _accept_move for why this exists.
+        self._alpha = float(os.environ.get("DFOPTIMIZER_CBANDIT_ALPHA", "0.05"))
+        self._effect_floor = float(os.environ.get("DFOPTIMIZER_CBANDIT_EFFECT_FLOOR", "0.02"))
+        # Visits an arm gets before it must start justifying itself. Below this it is EXPLORED on
+        # the acquisition's say-so; at or above it, a move must clear the test.
+        self._min_samples = int(os.environ.get("DFOPTIMIZER_CBANDIT_MIN_SAMPLES", "3"))
+        self._sample_window = int(os.environ.get("DFOPTIMIZER_CBANDIT_SAMPLE_WINDOW", "32"))
+        # Set to 0 to disable the gate entirely and recover the previous behaviour exactly.
+        self._accept_enabled = os.environ.get("DFOPTIMIZER_CBANDIT_ACCEPT", "1") != "0"
 
     # --- Planner-compatible registration (identical contract to Planner/CLBOPlanner) ---
     def register_knobs(self, knob_defs, current_values=None):
@@ -153,6 +169,10 @@ class CoordinateBanditPlanner:
         for short, level in cfg.items():
             n, mean = self._stats.get((short, level), (0, 0.0))
             self._stats[(short, level)] = (n + 1, mean + (wall - mean) / (n + 1))
+            buf = self._samples.get((short, level))
+            if buf is None:
+                buf = self._samples[(short, level)] = deque(maxlen=self._sample_window)
+            buf.append(float(wall))
         self._total_pulls += 1
 
     def _neighbourhood(self, short: str, current) -> List:
@@ -215,6 +235,54 @@ class CoordinateBanditPlanner:
                 best, best_score = lv, score
         return best, detail
 
+    def _accept_move(self, short: str, current, candidate):
+        """Should the acquisition's pick actually be DEPLOYED? Returns (bool, why).
+
+        THE FAILURE THIS FIXES, measured. cbandit issued 14 plans where the rules issued 2, and the
+        cause was not the search: it was that UCB will separate two arms whose means differ only by
+        noise, and then every window pays to move between them. The regression test that was
+        supposed to catch this (C7, "it settles") used a FLAT objective, on which UCB cannot tell
+        arms apart and quietly stops caring. The real objective is noisy, and on a noisy one UCB
+        chases the noise. The test encoded the failure already seen instead of the one not yet seen.
+
+        So search and COMMITMENT are separated. `_pick` stays a pure search policy and may propose
+        anything; this decides whether the proposal has earned a deployment. The rule is
+        clbo.accept_decision, which CLBO has always had and has only ever used in the OFFLINE
+        optimize() loop, never on the online path: a candidate must be BOTH significantly faster
+        (Welch p < alpha) AND meaningfully faster (relative gain >= effect_floor).
+
+        EXPLORATION IS NOT BLOCKED, which is the part that has to be right. An arm with fewer than
+        `min_samples` observations has no distribution to test, so Welch would return p=1.0 and
+        reject it forever -- the controller would freeze on whatever it happened to try first,
+        which is exactly the EXPLORE=3 failure (3.163 s/step, frozen on a badly-estimated
+        incumbent). Under-sampled arms are therefore allowed through on the acquisition's say-so.
+        That bounds free exploration to `min_samples` visits per arm, after which the arm is known
+        and must win on evidence.
+
+        Note what the constants are. alpha and effect_floor are a significance level and a minimum
+        interesting effect: standard statistical parameters that carry their meaning across
+        workloads. They are NOT of the same kind as `fetch_frac > 0.20` or
+        `reader_posix_time_proc_max > 20`, which encode a guess about a particular system's
+        behaviour. This replaces a domain magic number with a decision rule; it does not pretend to
+        have no constants at all.
+        """
+        if not self._accept_enabled:
+            return True, "gate_disabled"
+
+        base = list(self._samples.get((short, current), ()))
+        cand = list(self._samples.get((short, candidate), ()))
+
+        if len(cand) < self._min_samples:
+            return True, "explore_under_sampled"
+        if len(base) < self._min_samples:
+            # The arm we are ON is not yet characterised, so there is nothing to compare against.
+            # Staying costs nothing and earns the sample that makes the next comparison possible.
+            return False, "incumbent_under_sampled"
+
+        verdict = accept_decision(base, cand,
+                                  alpha=self._alpha, effect_floor=self._effect_floor)
+        return verdict == "accept", verdict
+
     # --- Planner-compatible decision entry ---
     def process_finding(self, finding: DiagnosisFindingMsg) -> List[ActionPlan]:
         if not self.knobs:
@@ -265,10 +333,20 @@ class CoordinateBanditPlanner:
                     cur = self._short_cfg()[short]
                     # 3. UCB over {stay, down, up}, cost-discounted.
                     choice, detail = self._pick(short, cur, dom)
+                    # 4. ACCEPTANCE. The search proposes; this decides whether the proposal has
+                    #    earned a deployment. Without it UCB pays to move between arms that differ
+                    #    only by noise -- 14 plans against the rules' 2.
+                    accepted, why = (True, "no_change")
+                    if choice != cur:
+                        accepted, why = self._accept_move(short, cur, choice)
+                        if not accepted:
+                            choice = cur
                     logger.info("optimizer.cbandit.decision",
                                 window=completed, dominant_domain=dom,
                                 domain_times={k: round(float(v), 4) for k, v in doms.items()},
                                 knob=short, current=cur, chose=choice,
+                                accept=why,
+                                n_current=len(self._samples.get((short, cur), ())),
                                 wall=round(obs["wall"], 4), candidates=detail)
                     nxt = dict(self._short_cfg())
                     nxt[short] = choice
