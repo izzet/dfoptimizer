@@ -145,16 +145,33 @@ class CoordinateBanditPlanner:
             return None
         fetch = m.get("fetch_iter_time_proc_max", 0.0)
         comm = m.get("comm_time_proc_max", 0.0)
+        domains = {
+            # Same decomposition CLBOPlanner uses, so the two planners see identical signal
+            # and any difference between them is the SEARCH, not the observation.
+            "input": m.get("reader_posix_time_proc_max", fetch),
+            "decode": m.get("reader_decode_time_proc_max", 0.0),
+            "comm": comm,
+            "compute": max(m.get("compute_time_proc_max", 0.0) - comm, 0.0),
+        }
+        # THE PART OF THE STEP WE CANNOT NAME.
+        #
+        # The domain times above do not have to add up to the wall, and on DLIO they badly do not:
+        # measured at 1 node, wall 6.1725 s = compute 2.5443 + fetch_iter 3.6282, of which
+        # reader_posix (the "input" domain) accounts for only 0.6064. Three seconds -- 49% of the
+        # step -- sat inside fetch attributed to nothing, and the planner still confidently
+        # concluded "compute dominates" by comparing 2.54 against 0.61.
+        #
+        # Under the old threshold rules this did not decide anything: they fired on within-layer
+        # ratios and never compared one domain against another. A domain-argmax planner makes
+        # attribution the whole decision, so the gap has to be visible rather than silently
+        # dropped. Carrying it as a domain with NO KNOBS is what makes it load-bearing: if it wins
+        # the argmax, there is nothing to move and the planner declines. That is a comparison, not
+        # a threshold -- no constant says how much unexplained time is "too much".
+        unattributed = max(float(wall) - sum(domains.values()), 0.0)
         return {
             "cfg": dict(self._planned_cfg.get(window, self._short_cfg())),
-            "domains": {
-                # Same decomposition CLBOPlanner uses, so the two planners see identical signal
-                # and any difference between them is the SEARCH, not the observation.
-                "input": m.get("reader_posix_time_proc_max", fetch),
-                "decode": m.get("reader_decode_time_proc_max", 0.0),
-                "comm": comm,
-                "compute": max(m.get("compute_time_proc_max", 0.0) - comm, 0.0),
-            },
+            "domains": domains,
+            "unattributed": unattributed,
             "wall": float(wall),
         }
 
@@ -319,8 +336,25 @@ class CoordinateBanditPlanner:
             # cost (3.2% of wall) is correctly swamped by the value of resolving an untried arm --
             # 3.2% is cheap against unknown headroom. Across domains it is the deciding term.
             wall = obs["wall"]
+            # The unexplained remainder COMPETES in the argmax. It owns no knob, so if it is the
+            # largest share of the step the planner has nothing to move and declines -- which is
+            # the correct response to "most of this step is something I cannot name", and is a
+            # comparison rather than a constant. Probe cost is 0 for it: there is nothing to probe.
             ranked = sorted(((v - self._cost_w * _PROBE_COST.get(d, 0.03) * wall, d)
-                             for d, v in doms.items() if d in actionable), reverse=True)
+                             for d, v in doms.items()),
+                            reverse=True)
+            unattr = obs.get("unattributed", 0.0)
+            if unattr > 0:
+                ranked = sorted(ranked + [(unattr, "unattributed")], reverse=True)
+            if ranked and ranked[0][1] not in actionable:
+                logger.info("optimizer.cbandit.declined",
+                            window=completed, reason="dominant share of the step is unattributed",
+                            dominant=ranked[0][1],
+                            unattributed=round(float(unattr), 4),
+                            unattributed_frac=round(float(unattr) / wall, 3) if wall else None,
+                            domain_times={k: round(float(v), 4) for k, v in doms.items()},
+                            wall=round(wall, 4))
+                ranked = []
             if ranked:
                 _v, dom = ranked[0]
                 # 2. ONE KNOB, from that domain. If the domain has several, take the least-pulled
