@@ -35,6 +35,13 @@ _DOMAIN_OF = {
     # workload "input"==STORAGE (the analyzer emits storage_time as the input metric); decode_threads
     # is its own DECODE domain; halo_width is the COMM knob.
     "decode_threads": "decode",
+    # DLIO storage-side actuators. These used to fall through to the "compute" default, which is
+    # silently wrong for a domain-driven planner: when the INPUT domain dominates it would never
+    # consider the very knobs that relieve it, and would look for relief in compute instead.
+    # data_source relocates the corpus (pfs -> node-local); transfer_size is the POSIX read size.
+    # computation_threads is deliberately absent: it defaults to "compute" and that is correct.
+    "data_source": "input",
+    "transfer_size": "input",
     "halo_width": "comm",
     "bucket_cap": "comm", "bucket_cap_mb": "comm", "reduce_bucket_size": "comm",
     "accumulate_grad_batches": "comm", "accum": "comm",
