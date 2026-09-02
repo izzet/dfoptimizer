@@ -89,21 +89,23 @@ def domains_from_metrics(m: Dict[str, float]) -> Dict[str, float]:
     is a within-domain diagnostic, not a domain time.
     """
     fetch = float(m.get("fetch_iter_time_proc_max", 0.0) or 0.0)
-    exposure_keys = (
-        "stall_storage_time_proc_max",
-        "stall_decode_time_proc_max",
-    )
-    exposure_present = all(key in m for key in exposure_keys)
+    storage_exposure_key = "stall_storage_time_proc_max"
+    decode_exposure_key = "stall_decode_time_proc_max"
+    # DLIO exposes the aggregate consumer wait as storage and has no separable decode stage.
+    # The storage key is therefore the availability contract. A present value of zero is a real
+    # measurement. Absence is the only case which may use the legacy fetch-minus-decode fallback.
+    exposure_present = storage_exposure_key in m
     m["domain_exposure_present"] = float(exposure_present)
     m["domain_exposure_fallback"] = float(not exposure_present)
 
     if exposure_present:
-        input_time = float(m.get(exposure_keys[0], 0.0) or 0.0)
-        decode = float(m.get(exposure_keys[1], 0.0) or 0.0)
+        input_time = float(m.get(storage_exposure_key, 0.0) or 0.0)
+        decode = float(m.get(decode_exposure_key, 0.0) or 0.0)
         logger.info(
             "optimizer.domains.exposure",
             storage=input_time,
             decode=decode,
+            decode_metric_present=decode_exposure_key in m,
             zero_exposure=(input_time == 0.0 and decode == 0.0),
         )
     else:
@@ -111,7 +113,7 @@ def domains_from_metrics(m: Dict[str, float]) -> Dict[str, float]:
         input_time = max(fetch - decode, 0.0)
         logger.warning(
             "optimizer.domains.exposure_fallback",
-            missing=[key for key in exposure_keys if key not in m],
+            missing=[storage_exposure_key],
             fetch=fetch,
             reader_decode=decode,
             reason="exposure metrics are absent, not zero",

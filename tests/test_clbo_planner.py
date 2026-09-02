@@ -126,5 +126,20 @@ def test_domains_distinguish_present_zero_exposure_from_absent(capsys):
     assert "exposure_fallback" not in capsys.readouterr().out
 
 
+def test_domains_accept_dlio_storage_only_exposure(capsys):
+    metrics = {
+        "fetch_iter_time_proc_max": 0.001,
+        "stall_storage_time_proc_max": 0.031,
+        "compute_time_proc_max": 0.020,
+    }
+    domains = domains_from_metrics(metrics)
+
+    assert domains["input"] == 0.031
+    assert domains["decode"] == 0.0
+    assert metrics["domain_exposure_present"] == 1.0
+    assert metrics["domain_exposure_fallback"] == 0.0
+    assert "exposure_fallback" not in capsys.readouterr().out
+
+
 if __name__ == "__main__":
     _run()
