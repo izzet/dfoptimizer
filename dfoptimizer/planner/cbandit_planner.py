@@ -107,6 +107,11 @@ class CoordinateBanditPlanner:
         # knob per window, chosen by least pulls -- which, because _record credits every knob every
         # window, was always the first-registered knob and never any other). See process_finding.
         self._escalate = os.environ.get("DFOPTIMIZER_CBANDIT_ESCALATE", "1") != "0"
+        # Consecutive application refusals after which a knob is excluded from selection. See
+        # apply_ack: an unappliable knob is never sampled, so it is permanently "under-sampled",
+        # so the acceptance gate never stops it, so it absorbs the escalation forever.
+        self._retire_after = int(os.environ.get("DFOPTIMIZER_CBANDIT_RETIRE_AFTER", "3"))
+        self._rejections: Dict[str, int] = {}
 
     # --- Planner-compatible registration (identical contract to Planner/CLBOPlanner) ---
     def register_knobs(self, knob_defs, current_values=None):
@@ -128,6 +133,65 @@ class CoordinateBanditPlanner:
 
     def _short_cfg(self) -> dict:
         return {self._short[k]: self.current_values[k] for k in self.knobs}
+
+    def apply_ack(self, plan_id: str = "", knob_id: str = "", status: str = "unknown",
+                  old_value=None, new_value=None, window_index: int = -1,
+                  target_nodes=None):
+        """Process an ack from the application.
+
+        THE BUG THIS FIXES, and it was loud in the log while being invisible in the results.
+        `CoordinateBanditPlanner` simply did not define this method, so `Optimizer._ack_loop` raised
+        AttributeError on EVERY ack -- 27,654 times in one five-minute two-node run -- caught the
+        exception, and immediately pulled the next one. Three consequences, none of which shows up
+        as a failed run:
+
+          1. the planner never learned whether anything it planned was actually applied,
+          2. a REJECTED plan left `current_values` holding the value the application had refused,
+             so the planner believed a knob had moved when it had not and never proposed it again
+             (fatal for `data_source`: one rejection retires the staging actuator for the run),
+          3. the ack thread spun on the error path, burning a core on the agent node.
+
+        `Planner` has always had this method, so the bug appeared only when the algorithm was
+        switched -- which is the configuration every evaluated arm now runs.
+
+        Reverting on a non-applied status is the whole point. `_pick` is driven by
+        `self.current_values`, so a stale entry there is not a cosmetic mismatch, it removes the
+        arm from the search.
+        """
+        logger.info("optimizer.cbandit.ack", plan_id=plan_id, knob_id=knob_id, status=status,
+                    old_value=old_value, new_value=new_value, window_index=window_index)
+        if knob_id not in self.knobs:
+            return
+        if status == "applied":
+            if new_value is not None:
+                self.current_values[knob_id] = self.knobs[knob_id].clamp(new_value)
+            return
+        # rejected / failed / anything else: the application is still on the old value, and our
+        # model has to say so or the arm is lost for the rest of the run.
+        revert = old_value if old_value is not None else self.knobs[knob_id].default
+        self.current_values[knob_id] = self.knobs[knob_id].clamp(revert)
+        short = self._short.get(knob_id, knob_id)
+        self._rejections[short] = self._rejections.get(short, 0) + 1
+        logger.info("optimizer.cbandit.ack.reverted", knob_id=knob_id, status=status,
+                    back_to=self.current_values[knob_id], rejections=self._rejections[short])
+        # CAPABILITY IS LEARNED, NOT ASSERTED. A knob the application cannot actually apply is
+        # indistinguishable, from here, from one it can: the plan is published, the ack comes back
+        # "rejected", and the planner proposes it again next window. Because a never-applied arm
+        # never accumulates samples it is permanently "under-sampled", so the acceptance gate lets
+        # it through every single time and it ABSORBS THE ESCALATION -- the cheapest-first walk stops
+        # at it and never reaches the knobs behind it.
+        #
+        # Measured on Corona, 2 nodes, cosmoflow: `transfer_size` is registered but is not a
+        # parameter of `make_loader` (open bug #30), so `@tunable` acks it `knob_not_in_kwargs`.
+        # In one epoch it took 144,048 rejections and 0 applications while `data_source`, ordered
+        # behind it, was never once reached. Retiring an arm the application has refused
+        # `_retire_after` times is the same move as PAPER-SPINE's "capability is LEARNED by probing
+        # rather than asserted", applied to appliability instead of to benefit.
+        if self._rejections[short] == self._retire_after:
+            logger.warning("optimizer.cbandit.knob.retired", knob=short, knob_id=knob_id,
+                           rejections=self._rejections[short],
+                           reason="the application refused this knob repeatedly; it is excluded "
+                                  "from selection so it cannot absorb the escalation")
 
     # --- window accumulation, same shape as CLBOPlanner ---
     def _accumulate(self, finding: DiagnosisFindingMsg):
@@ -324,8 +388,11 @@ class CoordinateBanditPlanner:
         actually risks. Ties keep registration order, so a domain whose knobs all cost the same
         behaves exactly as it did before, which is every knob set that predates `cost_seconds`.
         """
+        live = [s for s in owned if self._rejections.get(s, 0) < self._retire_after]
+        if not live:                    # every knob refused: keep the old list so behaviour is
+            live = list(owned)          # unchanged rather than the domain silently going empty
         if not self._escalate:
-            return list(owned)
+            return live
         cfg = self._short_cfg()
 
         def price(short):
@@ -334,7 +401,7 @@ class CoordinateBanditPlanner:
             return self._cost_w * min((self._move_cost(short, lv) for lv in alts),
                                       default=0.0)
 
-        return sorted(owned, key=lambda s: (price(s), owned.index(s)))
+        return sorted(live, key=lambda s: (price(s), owned.index(s)))
 
     def _escalation_state(self, short: str, current) -> Tuple[bool, str]:
         """Whether a costlier actuator may pass this cheaper coordinate.

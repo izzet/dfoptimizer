@@ -105,6 +105,19 @@ class Optimizer:
         bootstrap_prefetch_size = int(
             os.environ.get("DFOPTIMIZER_BOOTSTRAP_PREFETCH_SIZE", "2")
         )
+        bootstrap_data_source = os.environ.get(
+            "DFOPTIMIZER_BOOTSTRAP_DATA_SOURCE", "pfs"
+        )
+        # See main.py: data_source gets its own boundary because its apply contains a world
+        # collective and its abort test needs a FINISHED epoch to compute a horizon from.
+        data_source_boundary = os.environ.get(
+            "DLIO_DATA_SOURCE_BOUNDARY", "epoch_boundary"
+        )
+        # Costs, seconds, all measured on Corona; see main.py for the derivations. Carried here so
+        # the bootstrap registry is not a cheaper-looking copy of the application's.
+        stage_cost = float(os.environ.get("LIVEFLOW_STAGE_COST", "465"))
+        restripe_cost = float(os.environ.get("LIVEFLOW_RESTRIPE_COST", "15840"))
+        rebuild_cost = float(os.environ.get("LIVEFLOW_REBUILD_COST", "0.206"))
 
         knob_defs = {
             "dlio.prefetch_size": knob_def_from_dict(
@@ -153,11 +166,98 @@ class Optimizer:
                 },
                 target_function="DLIOBenchmark.make_loader",
             ),
+            # WHERE THE BYTES COME FROM. Declared here as well as in the application because the
+            # bootstrap WINS THE RACE: it runs the moment the optimizer stage starts, and the
+            # application's own five-knob registry does not arrive until its first make_loader call,
+            # about 20 s later under the agent harness. `_maybe_bootstrap_knobs` returns early once
+            # any knob is registered, so with only two knobs declared here the planner's first view
+            # of the world had no data-location actuator in it and could not have proposed one, and
+            # nothing anywhere reported that. register_knobs MERGES, so the application's definition
+            # still lands and wins on arrival; this only closes the window before it.
+            "dlio.data_source": knob_def_from_dict(
+                "dlio.data_source",
+                {
+                    "default": "pfs",
+                    "type": str,
+                    # "restriped" is opt-in: its resolver always declines (registered and costed,
+                    # not implemented), so as a declared level it is an arm that can never be
+                    # satisfied, never accumulates samples, and therefore never stops being
+                    # explored. It took the epoch boundary from "local" twice at 2 nodes.
+                    "values": (["pfs", "local", "restriped"]
+                               if os.environ.get("DFOPTIMIZER_REGISTER_RESTRIPED", "0") == "1"
+                               else ["pfs", "local"]),
+                    "scope": "node",
+                    # Cost per VALUE, not per knob: "pfs" is free, "local" is a 465 s collective
+                    # copy, "restriped" is a 4.4 h in-place rewrite. One number per knob would make
+                    # the restripe look as cheap as a stage or the stage as dear as a restripe.
+                    "cost_seconds": {"pfs": 0.0, "local": stage_cost,
+                                     "restriped": restripe_cost},
+                    "responds_to": {
+                        "storage_starved": {
+                            "direction": "set",
+                            "set_to": "local",
+                            "min_persistence": 1,
+                            "cooldown_windows": 999,
+                            "apply_when": data_source_boundary,
+                        },
+                    },
+                },
+                target_function="DLIOBenchmark.make_loader",
+            ),
+            # Read SHAPE, OFF BY DEFAULT: `make_loader` has no such parameter, so @tunable acks
+            # every plan `knob_not_in_kwargs` (open bug #30). Measured at 2 nodes: 144,048
+            # rejections, 0 applications, and because a never-applied arm stays under-sampled the
+            # acceptance gate never stops it and it absorbed the whole escalation.
+            **({"dlio.transfer_size": knob_def_from_dict(
+                "dlio.transfer_size",
+                {
+                    "default": 262144,
+                    "type": int,
+                    "values": [262144, 1048576, 4194304, 16777216],
+                    "scope": "job",
+                    "cost_seconds": rebuild_cost,
+                    "responds_to": {},
+                },
+                target_function="DLIOBenchmark.make_loader",
+            )} if os.environ.get("DFOPTIMIZER_REGISTER_TRANSFER_SIZE", "0") == "1" else {}),
+            # Decode parallelism, OFF BY DEFAULT -- see main.py for the measurement. In short: it
+            # falls to the default domain "compute", DLIO's compute is a time.sleep that no actuator
+            # can shorten, so a compute-dominant window handed the planner one knob and it drove it
+            # to 1 in 44 of 46 windows and made the run 50% slower. Unregistered, the compute domain
+            # owns nothing and a compute-dominant window declines, which is the honest answer.
+            **({"dlio.computation_threads": knob_def_from_dict(
+                "dlio.computation_threads",
+                {
+                    "default": 1,
+                    "type": int,
+                    "range": (1, knob_max_threads),
+                    "scope": "job",
+                    "cost_seconds": rebuild_cost,
+                    "responds_to": {
+                        "decode_pressure": {
+                            "direction": "increase",
+                            "step_mode": "add",
+                            "step": 2,
+                            "min_persistence": 1,
+                            "cooldown_windows": 2,
+                            "apply_when": knob_boundary,
+                        },
+                    },
+                },
+                target_function="DLIOBenchmark.make_loader",
+            )} if os.environ.get("DFOPTIMIZER_REGISTER_COMPUTATION_THREADS", "0") == "1" else {}),
         }
         current_values = {
             "dlio.prefetch_size": bootstrap_prefetch_size,
             "dlio.read_threads": bootstrap_read_threads,
+            "dlio.data_source": bootstrap_data_source,
         }
+        if "dlio.transfer_size" in knob_defs:
+            current_values["dlio.transfer_size"] = int(
+                os.environ.get("DFOPTIMIZER_BOOTSTRAP_TRANSFER_SIZE", "262144"))
+        if "dlio.computation_threads" in knob_defs:
+            current_values["dlio.computation_threads"] = int(
+                os.environ.get("DFOPTIMIZER_BOOTSTRAP_COMPUTATION_THREADS", "1"))
         self.planner.register_knobs(knob_defs, current_values=current_values)
         logger.info(
             "optimizer.registry.bootstrapped",
