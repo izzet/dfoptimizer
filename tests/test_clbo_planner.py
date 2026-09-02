@@ -5,7 +5,7 @@ window by window, emits ActionPlans, and drives the deployed incumbent toward th
 without the incumbent ever regressing. No pipeline/Mofka needed. Run:
   PYTHONPATH=. <venv>/bin/python tests/test_clbo_planner.py
 """
-from dfoptimizer.planner.clbo_planner import CLBOPlanner
+from dfoptimizer.planner.clbo_planner import CLBOPlanner, domains_from_metrics
 from dfoptimizer.types import DiagnosisFindingMsg, KnobDef
 
 
@@ -93,6 +93,37 @@ def _run():
     passed += 1
 
     print(f"\nALL {passed} CLBOPlanner interface tests PASSED")
+
+
+def test_domains_record_absent_exposure_fallback(capsys):
+    metrics = {
+        "fetch_iter_time_proc_max": 0.012,
+        "reader_decode_time_proc_max": 0.002,
+        "compute_time_proc_max": 0.020,
+    }
+    domains = domains_from_metrics(metrics)
+
+    assert domains["input"] == 0.010
+    assert domains["decode"] == 0.002
+    assert metrics["domain_exposure_present"] == 0.0
+    assert metrics["domain_exposure_fallback"] == 1.0
+    assert "exposure_fallback" in capsys.readouterr().out
+
+
+def test_domains_distinguish_present_zero_exposure_from_absent(capsys):
+    metrics = {
+        "fetch_iter_time_proc_max": 0.012,
+        "stall_storage_time_proc_max": 0.0,
+        "stall_decode_time_proc_max": 0.0,
+        "compute_time_proc_max": 0.020,
+    }
+    domains = domains_from_metrics(metrics)
+
+    assert domains["input"] == 0.0
+    assert domains["decode"] == 0.0
+    assert metrics["domain_exposure_present"] == 1.0
+    assert metrics["domain_exposure_fallback"] == 0.0
+    assert "exposure_fallback" not in capsys.readouterr().out
 
 
 if __name__ == "__main__":

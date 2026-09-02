@@ -25,8 +25,12 @@ import os
 import uuid
 from typing import Dict, List, Optional
 
+import structlog
+
 from ..types import ActionPlan, DiagnosisFindingMsg, KnobDef
 from .clbo import StructuredCLBO
+
+logger = structlog.get_logger()
 
 _DOMAIN_OF = {
     "num_workers": "input", "prefetch_factor": "input", "prefetch_size": "input",
@@ -85,11 +89,37 @@ def domains_from_metrics(m: Dict[str, float]) -> Dict[str, float]:
     is a within-domain diagnostic, not a domain time.
     """
     fetch = float(m.get("fetch_iter_time_proc_max", 0.0) or 0.0)
-    decode = float(m.get("reader_decode_time_proc_max", 0.0) or 0.0)
+    exposure_keys = (
+        "stall_storage_time_proc_max",
+        "stall_decode_time_proc_max",
+    )
+    exposure_present = all(key in m for key in exposure_keys)
+    m["domain_exposure_present"] = float(exposure_present)
+    m["domain_exposure_fallback"] = float(not exposure_present)
+
+    if exposure_present:
+        input_time = float(m.get(exposure_keys[0], 0.0) or 0.0)
+        decode = float(m.get(exposure_keys[1], 0.0) or 0.0)
+        logger.info(
+            "optimizer.domains.exposure",
+            storage=input_time,
+            decode=decode,
+            zero_exposure=(input_time == 0.0 and decode == 0.0),
+        )
+    else:
+        decode = float(m.get("reader_decode_time_proc_max", 0.0) or 0.0)
+        input_time = max(fetch - decode, 0.0)
+        logger.warning(
+            "optimizer.domains.exposure_fallback",
+            missing=[key for key in exposure_keys if key not in m],
+            fetch=fetch,
+            reader_decode=decode,
+            reason="exposure metrics are absent, not zero",
+        )
     comm = float(m.get("comm_time_proc_max", 0.0) or 0.0)
     compute = float(m.get("compute_time_proc_max", 0.0) or 0.0)
     return {
-        "input": max(fetch - decode, 0.0),
+        "input": input_time,
         "decode": decode,
         "comm": comm,
         "compute": max(compute - comm, 0.0),
