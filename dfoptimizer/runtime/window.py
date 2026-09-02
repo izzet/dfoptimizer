@@ -54,6 +54,8 @@ class Window:
         self,
         dftracer_instance: Any,
         max_every_n: Optional[int] = None,
+        epochs_total: Optional[int] = None,
+        steps_per_epoch: Optional[int] = None,
     ):
         self._dft = dftracer_instance
         self._every_n = 1
@@ -62,6 +64,52 @@ class Window:
         self._window_index = 0
         self._active = False
         self._start_time = 0
+        # HORIZON CONTRACT (liveflow_shm/HORIZON-CONTRACT.md). The application supplies the two
+        # facts only it knows -- how long the run is, and how long one epoch is -- and the window
+        # carries them onto every boundary event so the analyzer can publish epochs_remaining and
+        # windows_remaining. Without them a cost-aware planner cannot price an actuator over the
+        # run that is actually left, and the correct behaviour is then to decline: a 465 s stage
+        # that pays back over three epochs and one that pays back over fifty are the same request
+        # with different answers, and the difference is not visible from inside a window.
+        self._epochs_total = int(epochs_total) if epochs_total else None
+        self._steps_per_epoch = int(steps_per_epoch) if steps_per_epoch else None
+        self._epoch_index = 0
+
+    def set_epoch(self, epoch_index: int) -> None:
+        """Tell the window which epoch it is in. One based, per the contract."""
+        self._epoch_index = int(epoch_index)
+
+    @property
+    def windows_per_epoch(self) -> Optional[int]:
+        """Analysis windows expected in one full epoch AT THE CURRENT CADENCE.
+
+        Derived rather than stored, because `every_n` is self-tuning and a value captured at
+        construction would silently describe a cadence the run is no longer using.
+
+        CAVEAT worth carrying: if the cadence changes mid-run, windows already emitted were counted
+        at the old cadence, so `epochs_total * windows_per_epoch` is no longer a count of the
+        windows this run will actually produce. The epoch-based horizon does not have that problem,
+        which is why it is the one to trust when the two disagree.
+        """
+        if not self._steps_per_epoch or self._every_n <= 0:
+            return None
+        return max(1, -(-self._steps_per_epoch // self._every_n))   # ceil
+
+    def _horizon_args(self) -> Dict[str, Any]:
+        """The four contract fields, or NOTHING.
+
+        All four or none, deliberately. The analyzer publishes a derived remaining value only when
+        every source field is present, so emitting a partial set would produce an event that looks
+        instrumented and yields no metric -- the failure mode this whole contract exists to avoid.
+        """
+        wpe = self.windows_per_epoch
+        if not (self._epoch_index and self._epochs_total and wpe):
+            return {}
+        return {
+            "epoch_index": _INT_TAG(self._epoch_index),
+            "epochs_total": _INT_TAG(self._epochs_total),
+            "windows_per_epoch": _INT_TAG(wpe),
+        }
 
     @property
     def every_n(self) -> int:
@@ -103,6 +151,7 @@ class Window:
                     "window_index": _INT_TAG(self._window_index),
                     "every_n": _INT_TAG(self._every_n),
                     "counter": _INT_TAG(self._counter),
+                    **self._horizon_args(),
                 },
             )
             self._dft.exit_event()
@@ -136,6 +185,7 @@ class Window:
                     "window_index": _INT_TAG(self._window_index),
                     "every_n": _INT_TAG(self._every_n),
                     "counter": _INT_TAG(self._counter),
+                    **self._horizon_args(),
                 },
             )
             self._dft.exit_event()
@@ -168,6 +218,7 @@ class Window:
                         "every_n": _INT_TAG(self._every_n),
                         "counter": _INT_TAG(self._counter),
                         "flush": _INT_TAG(1),
+                        **self._horizon_args(),
                     },
                 )
                 self._dft.exit_event()
@@ -188,6 +239,7 @@ class Window:
                         "every_n": _INT_TAG(self._every_n),
                         "counter": _INT_TAG(self._counter),
                         "flush": _INT_TAG(1),
+                        **self._horizon_args(),
                     },
                 )
                 self._dft.exit_event()
