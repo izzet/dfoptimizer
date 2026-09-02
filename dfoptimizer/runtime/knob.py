@@ -22,6 +22,7 @@ def knob(
     scope: str = "job",
     responds_to: Optional[Dict[str, dict]] = None,
     cost_seconds: float = 0.0,
+    requires_unanimity: bool = False,
 ) -> dict:
     """Helper to declare a knob in @tunable.
 
@@ -43,6 +44,7 @@ def knob(
         "scope": scope,
         "responds_to": responds_to or {},
         "cost_seconds": cost_seconds,
+        "requires_unanimity": requires_unanimity,
     }
 
 
@@ -70,6 +72,7 @@ def knob_def_from_dict(knob_id: str, d: dict, target_function: str = "") -> Knob
         values=d.get("values"),
         scope=d.get("scope", "job"),
         cost_seconds=_coerce_cost(d.get("cost_seconds", 0.0)),
+        requires_unanimity=bool(d.get("requires_unanimity", False)),
         responds_to=responds_to,
         target_function=target_function,
     )
@@ -101,6 +104,7 @@ def knob_def_to_wire(kdef: KnobDef) -> dict:
         "responds_to": responds_wire,
         "target_function": kdef.target_function,
         "cost_seconds": kdef.cost_seconds,
+        "requires_unanimity": kdef.requires_unanimity,
     }
 
 
@@ -131,6 +135,7 @@ def knob_def_from_wire(d: dict) -> KnobDef:
         values=d.get("values"),
         scope=d.get("scope", "job"),
         cost_seconds=_coerce_cost(d.get("cost_seconds", 0.0)),
+        requires_unanimity=bool(d.get("requires_unanimity", False)),
         responds_to=responds_to,
         target_function=d.get("target_function", ""),
     )
@@ -142,6 +147,7 @@ def action(
     reversible: bool = True,
     abortable: bool = False,
     scope: str = "node",
+    requires_unanimity: bool = False,
     cost_fn=None,
     precondition_fn=None,
     effect_fn=None,
@@ -166,6 +172,7 @@ def action(
         "reversible": reversible,
         "abortable": abortable,
         "scope": scope,
+        "requires_unanimity": requires_unanimity,
         "cost_fn": cost_fn,
         "precondition_fn": precondition_fn,
         "effect_fn": effect_fn,
@@ -181,6 +188,7 @@ def action_def_from_dict(action_id: str, d: dict, target_function: str = "") -> 
         reversible=d.get("reversible", True),
         abortable=d.get("abortable", False),
         scope=d.get("scope", "node"),
+        requires_unanimity=bool(d.get("requires_unanimity", False)),
         cost_fn=d.get("cost_fn"),
         precondition_fn=d.get("precondition_fn"),
         effect_fn=d.get("effect_fn"),

@@ -96,6 +96,7 @@ class ActionDef:
             reversible=True,
             abortable=True,
             scope=kdef.scope,
+            requires_unanimity=kdef.requires_unanimity,
             cost_fn=lambda _o, _v, c=rebuild_seconds: c,
             precondition_fn=lambda _o, v, k=kdef: (k.clamp(v) == v,
                                                   "" if k.clamp(v) == v else "outside knob range"),
@@ -127,6 +128,10 @@ class KnobDef:
     # Collapsing those into one number per knob makes the expensive value look cheap or the cheap
     # value look expensive, and either way the ranking is wrong.
     cost_seconds: Any = 0.0
+
+    # True when every participant must apply the value at the same boundary. This is plan
+    # metadata, not permission to insert a collective into an application from the optimizer.
+    requires_unanimity: bool = False
 
     def cost_for(self, value=None) -> float:
         """Cost of moving this knob TO `value`.
@@ -169,6 +174,8 @@ class ActionPlan:
     opportunity_tag: str
     window_index: int
     target_nodes: List[str] = dc.field(default_factory=list)  # empty = all nodes
+    # A tag consumed by collective-aware runtimes. The planner does not implement the collective.
+    requires_unanimity: bool = False
 
 
 @dc.dataclass

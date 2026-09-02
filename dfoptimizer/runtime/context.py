@@ -391,6 +391,7 @@ class OptimizerContext:
             opportunity_tag=msg.get("opportunity_tag", ""),
             window_index=msg.get("window_index", 0),
             target_nodes=msg.get("target_nodes", []),
+            requires_unanimity=bool(msg.get("requires_unanimity", False)),
         )
 
         # Per-node plan filter: skip plans not targeting this node.

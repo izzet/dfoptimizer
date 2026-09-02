@@ -42,11 +42,10 @@ times, a comparison, not a threshold). Changes the search:
   3. STAY IS A LEGAL ARM. This is the structural fix. Exploitation must be reachable by the
      acquisition itself, not forced afterwards by a separate explore-budget -- which is what
      EXPLORE=3 did, and it froze on a badly-estimated incumbent at 3.163 s/step.
-  4. COST-AWARE. A decode probe is nearly free (fork-inherited limit, no worker restart) while an
-     input probe rebuilds the worker set at ~3.2% of runtime (phase 21). The bonus for trying an
-     arm is discounted by what trying it costs, so exploration is biased toward the cheap domain.
-     This is a genuinely cross-layer decision: a single-layer tuner cannot know that the same
-     nominal move is free in one domain and expensive in another.
+  4. COST-AWARE. Each candidate value carries its measured KnobDef cost in seconds. Acquisition
+     compares that cost with the candidate's expected wall-time gain over the observed windows or
+     epochs left, and expensive actuators wait until cheaper coordinates in the same domain have
+     been tried without benefit. No fixed run horizon or per-domain proxy cost is used.
 
 UCB rather than Expected Improvement, because UCB is a cumulative-regret algorithm and EI is not.
 
@@ -69,13 +68,6 @@ from .clbo import accept_decision
 from .clbo_planner import _domain_of, _levels_for, domains_from_metrics
 
 logger = structlog.get_logger()
-
-# Relative cost of PROBING a knob, as a fraction of an epoch, from liveflow_shm phase 21:
-# applying a knob through the gated/shared-memory path cost +3.2% when it forced a worker-set
-# rebuild and was free (-1.5%, within noise) when it did not. Decode moves a fork-inherited limit
-# and never restarts workers; input knobs rebuild the DataLoader.
-_PROBE_COST = {"decode": 0.002, "comm": 0.005, "input": 0.032, "compute": 0.032}
-
 
 class CoordinateBanditPlanner:
     """Drop-in alternative to Planner / CLBOPlanner for DFOPTIMIZER_ALGO=cbandit."""
@@ -111,6 +103,10 @@ class CoordinateBanditPlanner:
         self._sample_window = int(os.environ.get("DFOPTIMIZER_CBANDIT_SAMPLE_WINDOW", "32"))
         # Set to 0 to disable the gate entirely and recover the previous behaviour exactly.
         self._accept_enabled = os.environ.get("DFOPTIMIZER_CBANDIT_ACCEPT", "1") != "0"
+        # Cheapest-first escalation within the dominant domain. 0 restores the previous rule (one
+        # knob per window, chosen by least pulls -- which, because _record credits every knob every
+        # window, was always the first-registered knob and never any other). See process_finding.
+        self._escalate = os.environ.get("DFOPTIMIZER_CBANDIT_ESCALATE", "1") != "0"
 
     # --- Planner-compatible registration (identical contract to Planner/CLBOPlanner) ---
     def register_knobs(self, knob_defs, current_values=None):
@@ -163,12 +159,36 @@ class CoordinateBanditPlanner:
         # the argmax, there is nothing to move and the planner declines. That is a comparison, not
         # a threshold -- no constant says how much unexplained time is "too much".
         unattributed = max(float(wall) - sum(domains.values()), 0.0)
+        remaining, remaining_unit = self._remaining_run(m)
         return {
             "cfg": dict(self._planned_cfg.get(window, self._short_cfg())),
             "domains": domains,
             "unattributed": unattributed,
             "wall": float(wall),
+            "remaining": remaining,
+            "remaining_unit": remaining_unit,
         }
+
+    @staticmethod
+    def _remaining_run(metrics: dict) -> Tuple[Optional[float], Optional[str]]:
+        """Return the remaining-run multiplier reported to the agent, without a fallback.
+
+        A window count and an epoch count are both valid because the analyzer may publish either
+        kind of aggregate. Inventing a default horizon would make the same actuator payable or
+        unpayable based on a planner constant rather than the run that is actually left.
+        """
+        for key, unit in (("windows_remaining", "windows"),
+                          ("remaining_windows", "windows"),
+                          ("epochs_remaining", "epochs"),
+                          ("remaining_epochs", "epochs")):
+            value = metrics.get(key)
+            if value is None:
+                continue
+            try:
+                return max(float(value), 0.0), unit
+            except (TypeError, ValueError):
+                continue
+        return None, None
 
     def _record(self, cfg: dict, wall: float):
         """Credit the observed wall to every knob level that produced it.
@@ -202,12 +222,18 @@ class CoordinateBanditPlanner:
             out.append(levels[i + 1])
         return out
 
-    def _pick(self, short: str, current, domain: str):
-        """UCB over the neighbourhood, minimising wall, discounted by probe cost.
+    def _pick(self, short: str, current, domain: str, exposed_s: Optional[float] = None,
+              remaining: Optional[float] = None):
+        """UCB over the neighbourhood in remaining-run wall seconds.
 
         An unpulled arm gets the best observed wall as an optimistic prior rather than -inf, so a
         single unknown neighbour cannot hijack the whole run -- which is how CLBO ended up
         deploying num_workers=0.
+
+        Candidate cost is the measured cost of the VALUE being requested. The candidate's
+        optimistic per-window gain is bounded by the observed dominant-domain exposure, then
+        multiplied by the windows or epochs left. A positive-cost move with no reported remaining
+        horizon is not payable. COST_W=0 removes the cost and payback terms for the ablation.
         """
         cands = self._neighbourhood(short, current)
         seen = [m for (s, _l), (n, m) in self._stats.items() if s == short and n > 0]
@@ -225,9 +251,8 @@ class CoordinateBanditPlanner:
         # for exploring it.
         cur_n, cur_mean = self._stats.get((short, current), (0, 0.0))
         prior = cur_mean if cur_n > 0 else (optimistic if seen else 0.0)
-        # The confidence radius is a FRACTION of the objective's scale. Written in absolute units
-        # it would mean something different on a 1 s/step workload than on a 10 s/step one, and the
-        # probe-cost term below (which is inherently relative) could never be commensurate with it.
+        # The confidence radius is a FRACTION of the objective's scale. The acquisition below then
+        # converts both predicted wall and actuation cost to seconds over the remaining run.
         scale = optimistic if optimistic > 0 else 1.0
         best, best_score = current, float("inf")
         detail = []
@@ -237,15 +262,105 @@ class CoordinateBanditPlanner:
             # promising. With the prior above this makes exploration decay as evidence accumulates
             # instead of persisting forever.
             bonus = self._c * scale * math.sqrt(math.log(max(self._total_pulls, 2)) / max(n, 1))
-            # Cost of CHANGING to this arm. Staying is free by construction, which is what makes
-            # exploitation reachable without a separate budget.
-            cost = 0.0 if lv == current else self._cost_w * _PROBE_COST.get(domain, 0.03) * scale
-            score = mean - bonus + cost
+            if lv == current and remaining is not None and self._cost_w != 0.0:
+                # The incumbent is the reference, not an exploration target. Giving it an
+                # optimism bonus subtracts that bonus from every candidate's apparent gain and can
+                # make a move fail the payback comparison after its own gain already cleared cost.
+                # Preserve the legacy UCB exactly when no priced remaining-run decision is being
+                # made, including COST_W=0 and knobs declared with zero cost.
+                bonus = 0.0
+            cost_s = 0.0 if lv == current else self._move_cost(short, lv)
+            weighted_cost_s = self._cost_w * cost_s
+            gain_per_window_s = max(cur_mean - (mean - bonus), 0.0)
+            if exposed_s is not None:
+                gain_per_window_s = min(gain_per_window_s, max(float(exposed_s), 0.0))
+            gain_s = (gain_per_window_s * remaining
+                      if remaining is not None else None)
+            payable = (lv == current or self._cost_w == 0.0 or cost_s <= 0.0
+                       or (gain_s is not None and gain_s > weighted_cost_s))
+
+            # Multiplying the predicted wall by the observed remaining count puts it in the same
+            # units as cost_for(): wall seconds over the rest of this run. With no horizon, only a
+            # zero-cost move has a defensible score.
+            if remaining is not None:
+                score = (mean - bonus) * remaining + weighted_cost_s
+            elif weighted_cost_s <= 0.0:
+                score = mean - bonus
+            else:
+                score = float("inf")
+            if not payable:
+                score = float("inf")
             detail.append({"level": lv, "n": n, "mean": round(mean, 4),
-                           "bonus": round(bonus, 4), "cost": round(cost, 4), "score": round(score, 4)})
+                           "bonus": round(bonus, 4), "gain_s": _rounded(gain_s),
+                           "cost_s": round(cost_s, 4), "payable": payable,
+                           "score": _rounded(score)})
             if score < best_score:
                 best, best_score = lv, score
         return best, detail
+
+    def _move_cost(self, short: str, value) -> float:
+        """Seconds to move `short` to `value`, from the knob's own declaration. 0 for no move.
+
+        Reads `KnobDef.cost_seconds`, which may be a scalar or a per-VALUE dict. Per value matters:
+        `data_source` costs 0 for "pfs", 465 s for "local" and ~4.4 h for "restriped", and one
+        number per knob would make the restripe look as cheap as the stage.
+        """
+        cfg = self._short_cfg()
+        if short in cfg and cfg[short] == value:
+            return 0.0
+        for kid, kd in self.knobs.items():
+            if self._short.get(kid) == short:
+                try:
+                    return float(kd.cost_for(value))
+                except Exception:                     # noqa: BLE001 - a cost must never break a decision
+                    return 0.0
+        return 0.0
+
+    def _escalation_order(self, owned: List[str]) -> List[str]:
+        """The domain's knobs, cheapest available move first.
+
+        A knob's price for this window is the cost of the CHEAPEST move it could make away from
+        where it is -- not the cost of its most expensive value -- because that is what asking it
+        actually risks. Ties keep registration order, so a domain whose knobs all cost the same
+        behaves exactly as it did before, which is every knob set that predates `cost_seconds`.
+        """
+        if not self._escalate:
+            return list(owned)
+        cfg = self._short_cfg()
+
+        def price(short):
+            cur = cfg.get(short)
+            alts = [lv for lv in self._neighbourhood(short, cur) if lv != cur]
+            return self._cost_w * min((self._move_cost(short, lv) for lv in alts),
+                                      default=0.0)
+
+        return sorted(owned, key=lambda s: (price(s), owned.index(s)))
+
+    def _escalation_state(self, short: str, current) -> Tuple[bool, str]:
+        """Whether a costlier actuator may pass this cheaper coordinate.
+
+        Every neighbouring value must have enough observations for the same CLBO acceptance test
+        used at commitment time, and none may help. A coordinate with no neighbouring value is
+        exhausted by construction. Cost weighting disabled means there is no cheaper tier to
+        protect, so this rule does not retain a hidden cost preference in the ablation.
+        """
+        if self._cost_w == 0.0:
+            return True, "cost_weighting_disabled"
+        alts = [lv for lv in self._neighbourhood(short, current) if lv != current]
+        if not alts:
+            return True, "neighbourhood_exhausted"
+        base = list(self._samples.get((short, current), ()))
+        if len(base) < self._min_samples:
+            return False, "incumbent_under_sampled"
+        for lv in alts:
+            cand = list(self._samples.get((short, lv), ()))
+            if len(cand) < self._min_samples:
+                return False, f"untried_neighbour:{lv}"
+            verdict = accept_decision(base, cand,
+                                      alpha=self._alpha, effect_floor=self._effect_floor)
+            if verdict == "accept":
+                return False, f"helpful_neighbour:{lv}"
+        return True, "neighbourhood_exhausted_no_help"
 
     def _accept_move(self, short: str, current, candidate):
         """Should the acquisition's pick actually be DEPLOYED? Returns (bool, why).
@@ -318,66 +433,122 @@ class CoordinateBanditPlanner:
             #    threshold -- this is the part the paper's contribution rests on.
             doms = obs["domains"]
             actionable = {d for d in self._domain.values()}
-            # COST-DISCOUNTED DOMAIN RANKING. Raw argmax picks the domain holding the most time;
-            # this subtracts what PROBING that domain costs, in the same units. When one domain
-            # clearly dominates, the discount is irrelevant and the ranking is unchanged. When two
-            # domains are close, the cheaper-to-probe one wins -- and THAT is a decision no
-            # single-layer tuner can make, because it requires knowing that the same nominal move
-            # is free in one layer (fork-inherited limit, no restart) and forks a whole worker set
-            # in another. Threshold-free: there is no "close enough" constant, the subtraction
-            # decides.
-            #
-            # Placed here rather than inside _pick() on purpose. Within a single knob the probe
-            # cost (3.2% of wall) is correctly swamped by the value of resolving an untried arm --
-            # 3.2% is cheap against unknown headroom. Across domains it is the deciding term.
             wall = obs["wall"]
             # The unexplained remainder COMPETES in the argmax. It owns no knob, so if it is the
             # largest share of the step the planner has nothing to move and declines -- which is
-            # the correct response to "most of this step is something I cannot name", and is a
-            # comparison rather than a constant. Probe cost is 0 for it: there is nothing to probe.
-            ranked = sorted(((v - self._cost_w * _PROBE_COST.get(d, 0.03) * wall, d)
-                             for d, v in doms.items()),
-                            reverse=True)
+            # the correct response to "most of this step is something I cannot name". Actuation
+            # cost ranks candidates only after raw exposed time has named the dominant domain.
+            ranked = sorted(((v, d) for d, v in doms.items()), reverse=True)
             unattr = obs.get("unattributed", 0.0)
             if unattr > 0:
                 ranked = sorted(ranked + [(unattr, "unattributed")], reverse=True)
             if ranked and ranked[0][1] not in actionable:
-                logger.info("optimizer.cbandit.declined",
-                            window=completed, reason="dominant share of the step is unattributed",
-                            dominant=ranked[0][1],
-                            unattributed=round(float(unattr), 4),
-                            unattributed_frac=round(float(unattr) / wall, 3) if wall else None,
-                            domain_times={k: round(float(v), 4) for k, v in doms.items()},
-                            wall=round(wall, 4))
+                logger.info(
+                    "optimizer.cbandit.decision", window=completed, decision="decline",
+                    reason="dominant share of the step is unattributed",
+                    dominant=ranked[0][1], gain_s=0.0, cost_s=0.0,
+                    horizon_count=obs.get("remaining"),
+                    horizon_unit=obs.get("remaining_unit"), escalation_state="not_actionable",
+                    unattributed=round(float(unattr), 4),
+                    unattributed_frac=round(float(unattr) / wall, 3) if wall else None,
+                    domain_times={k: round(float(v), 4) for k, v in doms.items()},
+                    wall=round(wall, 4))
                 ranked = []
             if ranked:
                 _v, dom = ranked[0]
-                # 2. ONE KNOB, from that domain. If the domain has several, take the least-pulled
-                #    so attention rotates instead of fixating.
+                # 2. ONE KNOB, from that domain, CHEAPEST FIRST.
+                #
+                #    THE BUG THIS REPLACES, and it made the expensive actuator unreachable rather
+                #    than merely unlikely. The rule was "take the least-pulled so attention rotates
+                #    instead of fixating", implemented as argmin over
+                #        pulls[s] = sum of _stats counts across s's levels.
+                #    But `_record` credits EVERY knob in the config on EVERY completed window, so
+                #    all knobs in a domain always carry the SAME pull count, `min` over equal keys
+                #    returns the first item in registration order, and that knob is selected for
+                #    every window of the run. On DLIO the input domain owns prefetch_size,
+                #    read_threads, data_source and transfer_size, so prefetch_size was chosen every
+                #    time and `data_source` -- the staging actuator, the only one that can move a
+                #    storage-bound cell -- was never once considered. Nothing reported this: the
+                #    loop ran, decided, actuated and never mentioned the knob it could not see.
+                #
+                #    The replacement is not a better tie-break, it is the rule this system already
+                #    claims to follow. `KnobDef.cost_for(value)` has carried per-value costs since
+                #    the ActionDef work (loader rebuild 0.21 s, stage 465 s, restripe 4.4 h) and no
+                #    planner read it. Order the domain's knobs by what their cheapest available move
+                #    COSTS, try them in that order, and stop at the first one that both wants to
+                #    move and clears the acceptance gate. A knob that says "stay" has nothing to
+                #    offer this window, so the search escalates to the next-cheapest instead of
+                #    ending the window having asked one knob.
+                #
+                #    That produces the documented escalation -- read_threads, then prefetch, then
+                #    staging -- as a CONSEQUENCE of measurement rather than as a preference: the
+                #    expensive actuator is reached exactly when the cheap ones have converged, and
+                #    the acceptance gate (not a threshold) decides what "converged" means.
+                #
+                #    DFOPTIMIZER_CBANDIT_ESCALATE=0 restores the old single-knob-per-window rule.
                 owned = [s for s in self._short.values() if self._domain[s] == dom]
                 if owned:
-                    pulls = {s: sum(n for (ss, _l), (n, _m) in self._stats.items() if ss == s)
-                             for s in owned}
-                    short = min(owned, key=lambda s: pulls[s])
-                    cur = self._short_cfg()[short]
-                    # 3. UCB over {stay, down, up}, cost-discounted.
-                    choice, detail = self._pick(short, cur, dom)
-                    # 4. ACCEPTANCE. The search proposes; this decides whether the proposal has
-                    #    earned a deployment. Without it UCB pays to move between arms that differ
-                    #    only by noise -- 14 plans against the rules' 2.
-                    accepted, why = (True, "no_change")
-                    if choice != cur:
-                        accepted, why = self._accept_move(short, cur, choice)
-                        if not accepted:
-                            choice = cur
+                    order = self._escalation_order(owned)
+                    cfg_now = self._short_cfg()
+                    short, cur, choice, detail, why = None, None, None, [], "no_change"
+                    tried = []
+                    for cand_short in order:
+                        cand_cur = cfg_now[cand_short]
+                        cand_choice, cand_detail = self._pick(
+                            cand_short, cand_cur, dom, exposed_s=doms[dom],
+                            remaining=obs.get("remaining"))
+                        if cand_choice == cand_cur:
+                            may_escalate, esc_state = self._escalation_state(cand_short, cand_cur)
+                            tried.append({"knob": cand_short, "verdict": "stay",
+                                          "escalation": esc_state})
+                            if short is None:      # remember the cheapest, for the log and the ack
+                                short, cur, choice, detail = (cand_short, cand_cur,
+                                                              cand_choice, cand_detail)
+                                why = esc_state
+                            # Staying alone is not evidence of exhaustion. A costlier actuator may
+                            # pass only after all cheaper neighbours were sampled and rejected by
+                            # accept_decision, or after the coordinate reaches a boundary.
+                            if not self._escalate or not may_escalate:
+                                break
+                            continue
+                        accepted, cand_why = self._accept_move(cand_short, cand_cur, cand_choice)
+                        may_escalate, esc_state = self._escalation_state(cand_short, cand_cur)
+                        tried.append({"knob": cand_short, "verdict": cand_why,
+                                      "to": cand_choice,
+                                      "cost_s": round(self._move_cost(cand_short, cand_choice), 3),
+                                      "escalation": esc_state})
+                        if accepted:
+                            short, cur, choice, detail, why = (cand_short, cand_cur, cand_choice,
+                                                               cand_detail, cand_why)
+                            break
+                        if short is None:
+                            short, cur, choice, detail, why = (cand_short, cand_cur, cand_cur,
+                                                               cand_detail, cand_why)
+                        if not self._escalate or not may_escalate:
+                            break
+                    if short is None:              # defensive: `owned` was non-empty, so unreachable
+                        short = order[0]
+                        cur = choice = cfg_now[short]
+                    chosen_detail = next((d for d in detail if d["level"] == choice), {})
+                    gain_s = chosen_detail.get("gain_s") if choice != cur else 0.0
+                    cost_s = self._move_cost(short, choice)
+                    horizon_s = (float(doms[dom]) * float(obs["remaining"])
+                                 if obs.get("remaining") is not None else None)
+                    # One rationale record per decision. Gain and cost are remaining-run seconds.
                     logger.info("optimizer.cbandit.decision",
-                                window=completed, dominant_domain=dom,
+                                window=completed, decision=("move" if choice != cur else "stay"),
+                                dominant_domain=dom,
                                 domain_times={k: round(float(v), 4) for k, v in doms.items()},
                                 knob=short, current=cur, chose=choice,
-                                accept=why,
+                                accept=why, escalation=tried,
+                                gain_s=gain_s, cost_s=round(cost_s, 3),
+                                horizon_s=_rounded(horizon_s),
+                                horizon_count=obs.get("remaining"),
+                                horizon_unit=obs.get("remaining_unit"),
+                                escalation_state=tried,
                                 n_current=len(self._samples.get((short, cur), ())),
                                 wall=round(obs["wall"], 4), candidates=detail)
-                    nxt = dict(self._short_cfg())
+                    nxt = dict(cfg_now)
                     nxt[short] = choice
                     self._planned_cfg[w + 1] = dict(nxt)
                     if choice != cur:
@@ -389,6 +560,32 @@ class CoordinateBanditPlanner:
         self._win_metrics = {}
         self._accumulate(finding)
         return plans
+
+    @staticmethod
+    def _apply_when(kd) -> str:
+        """Where this knob's plan may be applied, taken from the knob's own definition.
+
+        THE BUG THIS FIXES, and it is silent. This was the literal string "window_boundary" for
+        every knob, so a knob that declares an epoch boundary got a window-boundary plan anyway and
+        the declaration did nothing. The rules Planner has always honoured it (planner.py:548,
+        `apply_when=response.apply_when`); cbandit and CLBO did not, so switching planner silently
+        changed WHERE an actuator fires.
+
+        It matters for exactly one knob so far, and there it decides the outcome rather than the
+        timing. `data_source` declares `epoch_boundary` because the horizon its abort test is judged
+        against (`gain_per_epoch * epochs_remaining`) is only measurable once an epoch has finished:
+        applied mid-epoch-1 the gain is 0, the horizon is 0, and the stage aborts after one chunk
+        having paid for it. A window-boundary plan for an epoch-boundary knob is therefore not a
+        late apply, it is a guaranteed abort that reports itself as a considered decision.
+
+        Falls back to "window_boundary", so every knob that declares nothing behaves exactly as
+        before and this cannot regress the parallelism knobs.
+        """
+        for resp in (getattr(kd, "responds_to", None) or {}).values():
+            aw = getattr(resp, "apply_when", None)
+            if aw:
+                return aw
+        return "window_boundary"
 
     def _plans_for(self, next_short_cfg: dict, finding: DiagnosisFindingMsg, dom: str) -> List[ActionPlan]:
         plans = []
@@ -408,12 +605,13 @@ class CoordinateBanditPlanner:
                 target_function=self._target_fn.get(kid, ""),
                 old_value=old_v,
                 new_value=new_v,
-                apply_when="window_boundary",
+                apply_when=self._apply_when(kd),
                 rationale=f"cbandit UCB coordinate step ({dom} domain, cost-weighted)",
                 finding_type=finding.finding_type,
                 severity=finding.severity_score,
                 opportunity_tag=(finding.opportunity_tags or [""])[0],
                 window_index=finding.window_index,
+                requires_unanimity=bool(getattr(kd, "requires_unanimity", False)),
             ))
         return plans
 
@@ -423,3 +621,9 @@ def _num(v):
         return float(v)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _rounded(value):
+    if value is None or not math.isfinite(float(value)):
+        return value
+    return round(float(value), 4)
