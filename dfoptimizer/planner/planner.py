@@ -503,7 +503,14 @@ class Planner:
                 old_value, kdef, finding, response.direction
             )
             if new_value is None:
-                # Fallback to doubling if evidence metrics unavailable
+                # INCREASE-ONLY FALLBACK, and it ignores `response.direction`. A `decrease`
+                # response whose evidence metrics are missing would therefore DOUBLE the knob.
+                # It does not fire today because the only `decrease` response in the DLIO registry
+                # (`reader_contention`) uses step_mode "add", not "evidence" -- but the asymmetry
+                # is real and this is the ablation-control planner, not the evaluated path
+                # (AGENTS.md sec 2: evaluated arms run threshold-free rules + cbandit). Left as is
+                # so the control reproduces old runs byte for byte; audited 2026-09-02 for the
+                # steer-down requirement.
                 new_value = max(old_value * 2, old_value + 1)
         elif response.direction == "increase":
             if step_mode == "multiply":
@@ -656,6 +663,11 @@ class Planner:
                 # significant, the model underestimates the real need
                 # (e.g. with gradient accumulation, fast no-sync steps
                 # can't be prefetched in time).  Probe by stepping +1.
+                # PROBE +1: increase-only by construction, and deliberately kept. It sits under
+                # `direction == "increase"`, so it cannot turn a decrease into an increase, and
+                # this planner is the ablation control. The evaluated path (cbandit) has a
+                # symmetric {stay, down, up} neighbourhood and is pinned by the descent tests
+                # D1-D4 in liveflow_shm/tests/test_cbandit.py.
                 if fetch_frac > 0.20:
                     target = old_value + 1
                     logger.info(
