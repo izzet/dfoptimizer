@@ -111,7 +111,7 @@ class Optimizer:
         # See main.py: data_source gets its own boundary because its apply contains a world
         # collective and its abort test needs a FINISHED epoch to compute a horizon from.
         data_source_boundary = os.environ.get(
-            "DLIO_DATA_SOURCE_BOUNDARY", "epoch_boundary"
+            "DLIO_DATA_SOURCE_BOUNDARY", "window_boundary"
         )
         # Costs, seconds, all measured on Corona; see main.py for the derivations. Carried here so
         # the bootstrap registry is not a cheaper-looking copy of the application's.
