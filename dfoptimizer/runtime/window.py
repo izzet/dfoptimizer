@@ -95,6 +95,24 @@ class Window:
             return None
         return max(1, -(-self._steps_per_epoch // self._every_n))   # ceil
 
+    def _epoch_args(self) -> Dict[str, Any]:
+        """`epoch` on every window event, whenever the epoch is known.
+
+        The window events carried `epoch_index` and no `epoch`. The analyzer's high-level views are
+        keyed on `args.epoch`, so an event without it is dropped from the epoch-grouped frame, and
+        the DLIO rule set reads its objective (`window_wall_time_proc_max`) out of exactly that
+        frame. See ANALYZER-FASTPATH.md section 4. It is one tag, it costs nothing, and its absence
+        is the kind of thing that shows up as a metric that is silently NA rather than as an error.
+
+        Deliberately NOT part of the all-or-none horizon set below. The horizon trio is all-or-none
+        because a partial set yields an event that looks instrumented and produces no metric; the
+        grouping key has no such property and is worth emitting whenever it is known, including in
+        a run with no horizon at all.
+        """
+        if not self._epoch_index:
+            return {}
+        return {"epoch": _INT_TAG(self._epoch_index)}
+
     def _horizon_args(self) -> Dict[str, Any]:
         """The four contract fields, or NOTHING.
 
@@ -151,6 +169,7 @@ class Window:
                     "window_index": _INT_TAG(self._window_index),
                     "every_n": _INT_TAG(self._every_n),
                     "counter": _INT_TAG(self._counter),
+                    **self._epoch_args(),
                     **self._horizon_args(),
                 },
             )
@@ -185,6 +204,7 @@ class Window:
                     "window_index": _INT_TAG(self._window_index),
                     "every_n": _INT_TAG(self._every_n),
                     "counter": _INT_TAG(self._counter),
+                    **self._epoch_args(),
                     **self._horizon_args(),
                 },
             )
@@ -218,6 +238,7 @@ class Window:
                         "every_n": _INT_TAG(self._every_n),
                         "counter": _INT_TAG(self._counter),
                         "flush": _INT_TAG(1),
+                        **self._epoch_args(),
                         **self._horizon_args(),
                     },
                 )
@@ -239,6 +260,7 @@ class Window:
                         "every_n": _INT_TAG(self._every_n),
                         "counter": _INT_TAG(self._counter),
                         "flush": _INT_TAG(1),
+                        **self._epoch_args(),
                         **self._horizon_args(),
                     },
                 )
