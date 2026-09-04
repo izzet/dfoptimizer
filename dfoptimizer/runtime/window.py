@@ -75,6 +75,21 @@ class Window:
         self._steps_per_epoch = int(steps_per_epoch) if steps_per_epoch else None
         self._epoch_index = 0
 
+    def set_horizon(self, epochs_total: Optional[int], steps_per_epoch: Optional[int]) -> None:
+        """Supply the two application facts after construction.
+
+        DLIO knows both before it builds the Window and passes them to __init__. halo3d does not:
+        its steps-per-epoch is the length of the reader's shard list, which is only known further
+        down, after the loader is built. Without this setter halo3d could not satisfy the contract
+        at all, and it did not: every window of the 2-node loop cell on 2026-09-03 logged
+        `window.horizon.missing`. Same all-or-none discipline as _horizon_args: a falsy value
+        leaves the field unset rather than storing a zero that would read as instrumented.
+        """
+        if epochs_total:
+            self._epochs_total = int(epochs_total)
+        if steps_per_epoch:
+            self._steps_per_epoch = int(steps_per_epoch)
+
     def set_epoch(self, epoch_index: int) -> None:
         """Tell the window which epoch it is in. One based, per the contract."""
         self._epoch_index = int(epoch_index)
