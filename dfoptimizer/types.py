@@ -133,6 +133,15 @@ class KnobDef:
     # metadata, not permission to insert a collective into an application from the optimizer.
     requires_unanimity: bool = False
 
+    # True when moving this knob changes the REGIME the objective is measured in, so samples taken
+    # before the move and samples taken after it are not observations of the same quantity.
+    # Measured (T3-0 section 4p): staging the corpus off Lustre took a cosmoflow analysis window
+    # from ~37 s to ~5.6 s, a 6.7x shift, and every other knob's sample deque pooled both sides of
+    # it. Within-arm variance then swamps any between-arm difference and Welch cannot separate two
+    # prefetch levels however well they are sampled. This is declared by the knob rather than
+    # inferred from a cost or a name: only the knob knows that its action relocates the bytes.
+    changes_regime: bool = False
+
     def cost_for(self, value=None) -> float:
         """Cost of moving this knob TO `value`.
 

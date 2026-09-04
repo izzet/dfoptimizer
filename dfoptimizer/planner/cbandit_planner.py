@@ -79,6 +79,9 @@ class CoordinateBanditPlanner:
         self._target_fn: Dict[str, str] = {}
         self._domain: Dict[str, str] = {}
         self._levels: Dict[str, List] = {}
+        # Shorts whose knob declares that moving it changes the regime the objective is measured
+        # in. See _reset_other_arms.
+        self._regime_knobs: set = set()
         # Bandit statistics per (knob_short, level): pulls and mean observed wall.
         self._stats: Dict[Tuple[str, object], Tuple[int, float]] = {}
         # Recent wall samples per arm. The running mean above is enough to RANK arms, but not to
@@ -181,8 +184,16 @@ class CoordinateBanditPlanner:
             self.current_values[knob_id] = cur
             self._domain[short] = _domain_of(short)
             self._levels[short] = _levels_for(kd, cur)
+            # register_knobs MERGES and is called more than once (the optimizer bootstraps a
+            # registry before the application's own arrives), so the latest declaration wins here
+            # too rather than accumulating.
+            if getattr(kd, "changes_regime", False):
+                self._regime_knobs.add(short)
+            else:
+                self._regime_knobs.discard(short)
         logger.info("optimizer.cbandit.registered",
                     knobs=list(self._short.values()),
+                    regime_knobs=sorted(self._regime_knobs),
                     domains={s: self._domain[s] for s in self._short.values()},
                     levels={s: self._levels[s] for s in self._short.values()})
 
@@ -219,7 +230,11 @@ class CoordinateBanditPlanner:
             return
         if status == "applied":
             if new_value is not None:
-                self.current_values[knob_id] = self.knobs[knob_id].clamp(new_value)
+                applied = self.knobs[knob_id].clamp(new_value)
+                changed = applied != self.current_values.get(knob_id)
+                self.current_values[knob_id] = applied
+                if changed and self._short.get(knob_id, knob_id) in self._regime_knobs:
+                    self._reset_other_arms(self._short.get(knob_id, knob_id), window_index)
             return
         # rejected / failed / anything else: the application is still on the old value, and our
         # model has to say so or the arm is lost for the rest of the run.
@@ -247,6 +262,42 @@ class CoordinateBanditPlanner:
                            rejections=self._rejections[short],
                            reason="the application refused this knob repeatedly; it is excluded "
                                   "from selection so it cannot absorb the escalation")
+
+    def _reset_other_arms(self, short: str, window_index: int = -1):
+        """A regime-changing knob was APPLIED: every other knob's history is now uncomparable.
+
+        THE FINDING THIS ANSWERS (T3-0 section 4p, measured over reps 8 to 10 at 32 nodes). Each
+        arm's sample deque pooled windows from before and after staging. An epoch-1 window is about
+        37 s of wall and an epoch-2 window about 5.6 s, a 6.7x shift in the objective INSIDE one
+        arm's samples. Within-arm variance then swamps any between-arm difference, so Welch cannot
+        separate two prefetch levels no matter how well each is sampled, and the acceptance test
+        rejects for a reason that has nothing to do with the knob it is testing.
+
+        The fix is a statement about which samples are COMPARABLE, not a new constant and not a
+        threshold: there is no number here to tune. Observations taken under a different data
+        source are observations of a different objective, so they are discarded for every knob
+        except the one that moved. That knob keeps its own arms, because its arms are exactly what
+        distinguishes the two regimes and are the only place the old regime is still meaningful.
+
+        Consequences, both intended. Every other knob returns to under-sampled, so exploration
+        restarts and the first few post-staging moves are explore moves again; and the values just
+        left are re-measured on the new regime rather than trusted from the old one. The dwell
+        floor still spaces those moves, and `_total_pulls` is deliberately not zeroed: it counts
+        observed windows and only enters the UCB radius through a logarithm, so resetting it would
+        change the exploration weight without saying anything about comparability.
+
+        `_last_move_window` is also left alone. It records when a knob last moved, which is a fact
+        about the run and not an observation of the objective.
+        """
+        dropped = sorted({k[0] for k in self._samples if k[0] != short} |
+                         {k[0] for k in self._stats if k[0] != short})
+        n_samples = sum(len(v) for k, v in self._samples.items() if k[0] != short)
+        self._samples = {k: v for k, v in self._samples.items() if k[0] == short}
+        self._stats = {k: v for k, v in self._stats.items() if k[0] == short}
+        logger.info("optimizer.cbandit.regime_reset", knob=short, window=window_index,
+                    reset_knobs=dropped, samples_discarded=n_samples,
+                    reason="a regime-changing knob was applied; samples taken before it are not "
+                           "observations of the same objective")
 
     # --- window accumulation, same shape as CLBOPlanner ---
     def _accumulate(self, finding: DiagnosisFindingMsg):

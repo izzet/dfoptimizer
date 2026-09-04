@@ -192,6 +192,8 @@ class Optimizer:
                     # the restripe look as cheap as a stage or the stage as dear as a restripe.
                     "cost_seconds": {"pfs": 0.0, "local": stage_cost,
                                      "restriped": restripe_cost},
+                    # Moving the bytes moves the objective into another regime; see KnobDef.
+                    "changes_regime": True,
                     "responds_to": {
                         "storage_starved": {
                             "direction": "set",

@@ -23,6 +23,7 @@ def knob(
     responds_to: Optional[Dict[str, dict]] = None,
     cost_seconds: float = 0.0,
     requires_unanimity: bool = False,
+    changes_regime: bool = False,
 ) -> dict:
     """Helper to declare a knob in @tunable.
 
@@ -45,6 +46,7 @@ def knob(
         "responds_to": responds_to or {},
         "cost_seconds": cost_seconds,
         "requires_unanimity": requires_unanimity,
+        "changes_regime": changes_regime,
     }
 
 
@@ -73,6 +75,7 @@ def knob_def_from_dict(knob_id: str, d: dict, target_function: str = "") -> Knob
         scope=d.get("scope", "job"),
         cost_seconds=_coerce_cost(d.get("cost_seconds", 0.0)),
         requires_unanimity=bool(d.get("requires_unanimity", False)),
+        changes_regime=bool(d.get("changes_regime", False)),
         responds_to=responds_to,
         target_function=target_function,
     )
@@ -105,6 +108,7 @@ def knob_def_to_wire(kdef: KnobDef) -> dict:
         "target_function": kdef.target_function,
         "cost_seconds": kdef.cost_seconds,
         "requires_unanimity": kdef.requires_unanimity,
+        "changes_regime": kdef.changes_regime,
     }
 
 
@@ -136,6 +140,7 @@ def knob_def_from_wire(d: dict) -> KnobDef:
         scope=d.get("scope", "job"),
         cost_seconds=_coerce_cost(d.get("cost_seconds", 0.0)),
         requires_unanimity=bool(d.get("requires_unanimity", False)),
+        changes_regime=bool(d.get("changes_regime", False)),
         responds_to=responds_to,
         target_function=d.get("target_function", ""),
     )
