@@ -707,6 +707,7 @@ class CoordinateBanditPlanner:
                 if owned:
                     if storage_suspect:
                         order, suspect_reason = self._storage_first_order(owned, suspect_bw)
+                        promoted = {s for s in ("data_source", "transfer_size") if s in order}
                         logger.info(
                             "optimizer.cbandit.storage_suspect", window=completed,
                             reason="comm dominates and no registered knob owns comm",
@@ -717,13 +718,36 @@ class CoordinateBanditPlanner:
                             headroom=suspect_reason, order=order)
                     else:
                         order = self._escalation_order(owned)
+                        promoted = set()
                     cfg_now = self._short_cfg()
                     short, cur, choice, detail, why = None, None, None, [], "no_change"
                     tried = []
                     for cand_short in order:
                         cand_cur = cfg_now[cand_short]
+                        # THE EXPOSURE A STORAGE ACTUATOR CAN RELIEVE, in a storage-suspect
+                        # window, is not the input domain alone.
+                        #
+                        # `_pick` caps a candidate's per-window gain at `exposed_s`, and passing
+                        # the input domain there is what made staging structurally unreachable at
+                        # 32 nodes. Measured on cf_loop_n32_r2: input is 0.29 s per window while
+                        # comm is 11.19 s, so the cap was 38x too small, `data_source -> local`
+                        # priced its gain at a median 5.6 s (max 363) against a 465 s cost, came
+                        # back `payable: false` in all 1873 of its appearances, and the acquisition
+                        # never proposed it. The move was refused by the PRICE, not by the
+                        # acceptance test, which is why no amount of sampling would have reached it.
+                        #
+                        # Option 1's whole claim is that on a bulk-synchronous step the barrier IS
+                        # the slowest rank's storage time. A redirection that asserts that for the
+                        # CHOICE of knob and then denies it for the PRICE of the knob cannot ever
+                        # act, which is exactly what reps 1 and 2 measured: zero moves in 1702 and
+                        # 1696 at-ceiling windows. Storage candidates are therefore priced against
+                        # input + comm; every other candidate keeps the domain's own exposure.
+                        cand_exposed = doms[dom]
+                        if storage_suspect and cand_short in promoted:
+                            cand_exposed = float(doms.get("input", 0.0)) + float(
+                                doms.get("comm", 0.0))
                         cand_choice, cand_detail = self._pick(
-                            cand_short, cand_cur, dom, exposed_s=doms[dom],
+                            cand_short, cand_cur, dom, exposed_s=cand_exposed,
                             remaining=obs.get("remaining"))
                         if cand_choice == cand_cur:
                             may_escalate, esc_state = self._escalation_state(cand_short, cand_cur)
@@ -733,6 +757,22 @@ class CoordinateBanditPlanner:
                                 short, cur, choice, detail = (cand_short, cand_cur,
                                                               cand_choice, cand_detail)
                                 why = esc_state
+                            # A PROMOTED KNOB THAT STAYS MUST NOT END THE WINDOW.
+                            #
+                            # The escalation gate exists to stop a costlier actuator being reached
+                            # before the cheaper ones are exhausted. When the ceiling verdict
+                            # promotes a data-moving knob to the FRONT, that ordering inverts the
+                            # gate's assumption: the expensive knob is now first, so its "wait for
+                            # the cheaper ones" answer stops the cheaper ones from being asked at
+                            # all. Measured on cf_loop_n32_r1 and r2: data_source stayed with
+                            # `untried_neighbour:local` in 1772 and 1873 candidate slots, broke the
+                            # loop each time, and NOT ONE of the 1702 and 1696 at-ceiling windows
+                            # moved any knob. The promotion made the loop less active, not more.
+                            #
+                            # Promotion is about priority, not about exhaustion, so a promoted knob
+                            # that declines hands the window on instead of ending it.
+                            if cand_short in promoted:
+                                continue
                             # Staying alone is not evidence of exhaustion. A costlier actuator may
                             # pass only after all cheaper neighbours were sampled and rejected by
                             # accept_decision, or after the coordinate reaches a boundary.
