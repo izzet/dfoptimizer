@@ -107,6 +107,36 @@ class CoordinateBanditPlanner:
         # knob per window, chosen by least pulls -- which, because _record credits every knob every
         # window, was always the first-registered knob and never any other). See process_finding.
         self._escalate = os.environ.get("DFOPTIMIZER_CBANDIT_ESCALATE", "1") != "0"
+        # THE ONLY NEW CONSTANT the barrier-attribution rule introduces, and it is a per-cluster
+        # MEASUREMENT with provenance in liveflow_shm/tests/cluster_*.env, not a tuned number. Unset
+        # is a supported state: the rule still redirects a comm-dominant window to the storage
+        # candidates, it just cannot order them by headroom and says so in the decision record.
+        def _envf(name):
+            try:
+                return float(os.environ.get(name, "") or 0.0)
+            except ValueError:
+                return 0.0
+
+        # TWO measured constants and the run's node count, because a single-node ceiling is the
+        # WRONG comparison at scale and would have made this rule systematically say the opposite
+        # of the truth. Measured offline on the t47_cadence32 traces: at 32 nodes the median node
+        # read 0.694 GB/s, so against Corona's single-node reader ceiling (about 7 GB/s) every one
+        # of 2016 node-windows looks like it has headroom, when in fact each node is reading its
+        # full share of a filesystem the cluster has already saturated. Lustre's OSTs are a fixed
+        # shared resource: PAPER-SPINE measured the aggregate flat at 17.4 to 18.1 GB/s across 32
+        # and 56 nodes while the per-node share fell 0.545 -> 0.323, which is what a hard shared
+        # limit looks like. The ceiling that applies to a node is therefore the smaller of what one
+        # node can pull alone and what the cluster's aggregate leaves it.
+        self._node_ceiling_gbs = _envf("LUSTRE_NODE_READ_CEILING_GBS")
+        self._agg_ceiling_gbs = _envf("LUSTRE_AGGREGATE_READ_CEILING_GBS")
+        try:
+            self._nodes = int(os.environ.get("LIVEFLOW_NODES", "") or 0)
+        except ValueError:
+            self._nodes = 0
+        share = (self._agg_ceiling_gbs / self._nodes
+                 if self._agg_ceiling_gbs > 0 and self._nodes > 0 else 0.0)
+        cands = [c for c in (self._node_ceiling_gbs, share) if c > 0]
+        self._lustre_ceiling_gbs = min(cands) if cands else 0.0
         # Consecutive application refusals after which a knob is excluded from selection. See
         # apply_ack: an unappliable knob is never sampled, so it is permanently "under-sampled",
         # so the acceptance gate never stops it, so it absorbs the escalation forever.
@@ -231,6 +261,10 @@ class CoordinateBanditPlanner:
             "wall": float(wall),
             "remaining": remaining,
             "remaining_unit": remaining_unit,
+            # The storage layer's own two numbers for this node and window, carried so the
+            # barrier-attribution rule can look one layer down without a second metrics read.
+            "node_read_bytes": float(m.get("node_read_bytes", 0.0) or 0.0),
+            "node_read_busy_s": float(m.get("node_read_busy_s", 0.0) or 0.0),
         }
 
     @staticmethod
@@ -380,6 +414,66 @@ class CoordinateBanditPlanner:
                     return 0.0
         return 0.0
 
+    def _node_read_bandwidth(self, obs: dict) -> Optional[float]:
+        """This node's observed read bandwidth for the window, GB/s, or None if it did not read.
+
+        Bytes over the reader's BUSY time, not over the window wall: the question the ceiling
+        answers is "when this node was reading, was it reading as fast as the filesystem can serve
+        it", and dividing by wall would answer a different question and would fall with any idle
+        time. Busy time of zero means the node did not read in this window, which is an absence and
+        is returned as such rather than as a bandwidth of zero.
+        """
+        busy = obs.get("node_read_busy_s") or 0.0
+        by = obs.get("node_read_bytes") or 0.0
+        if busy <= 0.0 or by <= 0.0:
+            return None
+        return (by / 1e9) / busy
+
+    def _barrier_is_storage_suspect(self, dom: str, actionable: set) -> bool:
+        """Option 1, cross-layer PER NODE (user decision 2026-09-03).
+
+        At 32 nodes the per-step allreduce barrier carries the storage tail of whichever rank is
+        slowest, so `comm` wins the argmax on every node while no registered knob owns comm and
+        every node declines (T3-0 section 4k: comm 73.9% of the step, 1884 of 1984 windows
+        declined). The measured shape rules out the obvious alternative: the straggler ROTATES,
+        every one of 256 ranks was last at least once per epoch and the per-node ordering does not
+        survive an epoch (Spearman 0.076, section 4l), so there is no persistent culprit to find and
+        nothing to be gained by exchanging waits between nodes. Option 2 was rejected for exactly
+        that reason, and because it would add a node-to-node hop the SHM design does not have.
+
+        What is left is a LOCAL inference: a barrier this node did not cause is a barrier this node
+        waited at, and the thing to check is whether this node's own storage layer has headroom.
+        This predicate is the trigger only; the comparison against the ceiling is separate, so a
+        run with no ceiling still gets the redirection and simply cannot order the candidates by it.
+        """
+        return dom == "comm" and "comm" not in actionable
+
+    def _storage_first_order(self, owned: List[str], bw: Optional[float]) -> Tuple[List[str], str]:
+        """Order the storage candidates by what the ceiling comparison says is possible.
+
+        Below the ceiling there is bandwidth this node is not using, so more parallelism can take
+        it: keep the ordinary cheapest-first escalation, which starts at the free knobs. At or above
+        the ceiling there is nothing left to take and asking for more readers cannot help however
+        cheap it is, so the knobs that MOVE THE DATA come first (`data_source` stages the shard off
+        the shared filesystem, `transfer_size` changes what is asked of it per call).
+
+        The boundary is the measured ceiling itself. There is no fraction of it, no margin and no
+        tuned constant: `observed >= ceiling` is the whole test, which is what keeps this inside
+        AGENTS.md section 2's rule against hand-set domain thresholds. With no ceiling configured or
+        no read observed, the order is unchanged and the reason says so.
+        """
+        base = self._escalation_order(owned)
+        if bw is None:
+            return base, "no_read_observed"
+        ceiling = self._lustre_ceiling_gbs
+        if not ceiling:
+            return base, "no_ceiling_configured"
+        if bw < ceiling:
+            return base, "headroom"
+        movers = [s for s in base if s in ("data_source", "transfer_size")]
+        rest = [s for s in base if s not in ("data_source", "transfer_size")]
+        return movers + rest, "at_ceiling"
+
     def _escalation_order(self, owned: List[str]) -> List[str]:
         """The domain's knobs, cheapest available move first.
 
@@ -509,6 +603,22 @@ class CoordinateBanditPlanner:
             unattr = obs.get("unattributed", 0.0)
             if unattr > 0:
                 ranked = sorted(ranked + [(unattr, "unattributed")], reverse=True)
+            # BARRIER ATTRIBUTION, option 1 (user decision 2026-09-03; T3-0 section 4m). A
+            # comm-dominant window with no comm knob is not "nothing to do": on a bulk-synchronous
+            # step the barrier is where the slowest rank's storage tail is paid by everyone else,
+            # so the window is STORAGE-SUSPECT and this node's own storage candidates are admitted.
+            # The redirection is recorded on the decision, never silent, because a decision taken
+            # about a domain other than the dominant one has to be visible as such.
+            storage_suspect = False
+            suspect_bw = None
+            suspect_reason = None
+            if ranked and self._barrier_is_storage_suspect(ranked[0][1], actionable):
+                if any(self._domain[s] == "input" for s in self._short.values()):
+                    storage_suspect = True
+                    suspect_bw = self._node_read_bandwidth(obs)
+                    ranked = [(doms.get("input", 0.0), "input")] + [
+                        r for r in ranked if r[1] != "input"]
+
             if ranked and ranked[0][1] not in actionable:
                 logger.info(
                     "optimizer.cbandit.decision", window=completed, decision="decline",
@@ -555,7 +665,18 @@ class CoordinateBanditPlanner:
                 #    DFOPTIMIZER_CBANDIT_ESCALATE=0 restores the old single-knob-per-window rule.
                 owned = [s for s in self._short.values() if self._domain[s] == dom]
                 if owned:
-                    order = self._escalation_order(owned)
+                    if storage_suspect:
+                        order, suspect_reason = self._storage_first_order(owned, suspect_bw)
+                        logger.info(
+                            "optimizer.cbandit.storage_suspect", window=completed,
+                            reason="comm dominates and no registered knob owns comm",
+                            comm_s=round(float(doms.get("comm", 0.0)), 4),
+                            comm_frac=round(float(doms.get("comm", 0.0)) / wall, 3) if wall else None,
+                            node_read_gbs=round(suspect_bw, 4) if suspect_bw is not None else None,
+                            ceiling_gbs=self._lustre_ceiling_gbs or None,
+                            headroom=suspect_reason, order=order)
+                    else:
+                        order = self._escalation_order(owned)
                     cfg_now = self._short_cfg()
                     short, cur, choice, detail, why = None, None, None, [], "no_change"
                     tried = []
@@ -613,6 +734,15 @@ class CoordinateBanditPlanner:
                                 horizon_count=obs.get("remaining"),
                                 horizon_unit=obs.get("remaining_unit"),
                                 escalation_state=tried,
+                                # Recorded on EVERY decision so the release rule can be counted off
+                                # the log: a window where the dominant domain was comm, no knob
+                                # owned it, and the storage candidates were admitted instead.
+                                storage_suspect=storage_suspect,
+                                storage_headroom=suspect_reason,
+                                node_read_gbs=(round(suspect_bw, 4)
+                                               if suspect_bw is not None else None),
+                                ceiling_gbs=self._lustre_ceiling_gbs or None,
+                                unattributed=round(float(unattr), 4),
                                 n_current=len(self._samples.get((short, cur), ())),
                                 wall=round(obs["wall"], 4), candidates=detail)
                     nxt = dict(cfg_now)
