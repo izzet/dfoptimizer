@@ -100,6 +100,24 @@ class CoordinateBanditPlanner:
         # Visits an arm gets before it must start justifying itself. Below this it is EXPLORED on
         # the acquisition's say-so; at or above it, a move must clear the test.
         self._min_samples = int(os.environ.get("DFOPTIMIZER_CBANDIT_MIN_SAMPLES", "3"))
+        # BOUNDED EXPLORATION, PROPOSED AND NOT DEPLOYED (default 0 = today's behaviour exactly).
+        #
+        # Measured across all seven 32-node reps: every deployed move carries
+        # `explore_under_sampled`, and the reason is arithmetic rather than statistical. A value is
+        # held for a MEDIAN OF 2 WINDOWS before the walk steps again, while `min_samples` is 3, so
+        # at the moment a move is proposed the candidate has fewer than 3 observations, the
+        # acceptance test short-circuits to "explore", and the new value is then abandoned before it
+        # reaches 3 either. The walk outruns its own evidence and no value in the run is ever
+        # characterised. It is NOT the effect floor: the observed spread across prefetch levels is
+        # 26 to 43 percent of the window wall against a 2 percent floor. It is NOT the grid: the
+        # levels are well separated in measured wall.
+        #
+        # A minimum dwell equal to `min_samples` makes every visited value characterised by
+        # construction, and bounds the whole exploration at `levels x min_samples` windows: for the
+        # six prefetch levels that is 18 of an agent's ~74 windows in a 3-epoch run, leaving the
+        # rest to exploit. Set DFOPTIMIZER_CBANDIT_MIN_DWELL=3 to enable.
+        self._min_dwell = int(os.environ.get("DFOPTIMIZER_CBANDIT_MIN_DWELL", "0"))
+        self._last_move_window: Dict[str, int] = {}
         self._sample_window = int(os.environ.get("DFOPTIMIZER_CBANDIT_SAMPLE_WINDOW", "32"))
         # Set to 0 to disable the gate entirely and recover the previous behaviour exactly.
         self._accept_enabled = os.environ.get("DFOPTIMIZER_CBANDIT_ACCEPT", "1") != "0"
@@ -780,6 +798,10 @@ class CoordinateBanditPlanner:
                                 break
                             continue
                         accepted, cand_why = self._accept_move(cand_short, cand_cur, cand_choice)
+                        if accepted and self._min_dwell > 0:
+                            held = completed - self._last_move_window.get(cand_short, -10**9)
+                            if held < self._min_dwell:
+                                accepted, cand_why = False, "dwell:%d<%d" % (held, self._min_dwell)
                         may_escalate, esc_state = self._escalation_state(cand_short, cand_cur)
                         tried.append({"knob": cand_short, "verdict": cand_why,
                                       "to": cand_choice,
@@ -825,6 +847,8 @@ class CoordinateBanditPlanner:
                                 unattributed=round(float(unattr), 4),
                                 n_current=len(self._samples.get((short, cur), ())),
                                 wall=round(obs["wall"], 4), candidates=detail)
+                    if choice != cur:
+                        self._last_move_window[short] = completed
                     nxt = dict(cfg_now)
                     nxt[short] = choice
                     self._planned_cfg[w + 1] = dict(nxt)
