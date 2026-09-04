@@ -127,6 +127,7 @@ class CoordinateBanditPlanner:
         # and 56 nodes while the per-node share fell 0.545 -> 0.323, which is what a hard shared
         # limit looks like. The ceiling that applies to a node is therefore the smaller of what one
         # node can pull alone and what the cluster's aggregate leaves it.
+        self._last_bw_source = None
         self._node_ceiling_gbs = _envf("LUSTRE_NODE_READ_CEILING_GBS")
         self._agg_ceiling_gbs = _envf("LUSTRE_AGGREGATE_READ_CEILING_GBS")
         try:
@@ -265,6 +266,8 @@ class CoordinateBanditPlanner:
             # barrier-attribution rule can look one layer down without a second metrics read.
             "node_read_bytes": float(m.get("node_read_bytes", 0.0) or 0.0),
             "node_read_busy_s": float(m.get("node_read_busy_s", 0.0) or 0.0),
+            # Diagnostic only; see the note in dlio-signal.yaml.
+            "node_read_bytes_any": float(m.get("node_read_bytes_any", 0.0) or 0.0),
         }
 
     @staticmethod
@@ -423,11 +426,35 @@ class CoordinateBanditPlanner:
         time. Busy time of zero means the node did not read in this window, which is an absence and
         is returned as such rather than as a bandwidth of zero.
         """
-        busy = obs.get("node_read_busy_s") or 0.0
         by = obs.get("node_read_bytes") or 0.0
-        if busy <= 0.0 or by <= 0.0:
+        src = "reader_posix"
+        if by <= 0.0:
+            # FALL BACK TO THE BROAD POSIX LAYER, and say which was used.
+            #
+            # reader_posix needs `_reader` in the event category, which _fix_file_posix_category
+            # writes only when the file's path matches a configured purpose, and on the streaming
+            # path it does not: measured on t4m_storagegate4, reader_posix_read_size_sum was 0 on
+            # all 125 windows while posix_read_size_sum was 11.56 GB per window on all 125. That is
+            # an analyzer defect and it is recorded as one in T3-0 section 4m; it is not this
+            # planner's to fix.
+            #
+            # The broad layer is a superset: it counts every read the ranks make, not only the ones
+            # under the data folder. For a DLIO training run with checkpointing off that is the
+            # corpus and little else, so it is the right quantity here and slightly OVER-states the
+            # read, which pushes the comparison towards "at the ceiling" -- the conservative
+            # direction, since it favours moving the data over asking for more readers that may not
+            # help.
+            by = obs.get("node_read_bytes_any") or 0.0
+            src = "posix"
+        wall = obs.get("wall") or 0.0
+        if by <= 0.0 or wall <= 0.0:
             return None
-        return (by / 1e9) / busy
+        self._last_bw_source = src
+        # Bytes over the window's ELAPSED time, which is the rate the filesystem delivered to this
+        # node. An earlier version divided by the busiest rank's read busy time, which is not a
+        # bandwidth when 8 ranks read concurrently: it returned 22.2 GB/s for one node, above the
+        # 17.4 GB/s the whole 32-node cluster was measured at. Busy time is kept as a diagnostic.
+        return (by / 1e9) / wall
 
     def _barrier_is_storage_suspect(self, dom: str, actionable: set) -> bool:
         """Option 1, cross-layer PER NODE (user decision 2026-09-03).
@@ -637,7 +664,9 @@ class CoordinateBanditPlanner:
                     node_read_gbs=(round(_bw, 4) if _bw is not None else None),
                     node_read_busy_s=round(float(obs.get("node_read_busy_s") or 0.0), 4),
                     node_read_bytes=float(obs.get("node_read_bytes") or 0.0),
+                    node_read_bytes_any=float(obs.get("node_read_bytes_any") or 0.0),
                     ceiling_gbs=self._lustre_ceiling_gbs or None,
+                    bw_source=self._last_bw_source,
                     storage_suspect=storage_suspect,
                     domain_times={k: round(float(v), 4) for k, v in doms.items()},
                     wall=round(wall, 4))
