@@ -115,8 +115,14 @@ class CoordinateBanditPlanner:
         # A minimum dwell equal to `min_samples` makes every visited value characterised by
         # construction, and bounds the whole exploration at `levels x min_samples` windows: for the
         # six prefetch levels that is 18 of an agent's ~74 windows in a 3-epoch run, leaving the
-        # rest to exploit. Set DFOPTIMIZER_CBANDIT_MIN_DWELL=3 to enable.
-        self._min_dwell = int(os.environ.get("DFOPTIMIZER_CBANDIT_MIN_DWELL", "0"))
+        # rest to exploit.
+        #
+        # APPROVED AS THE EVALUATED DEFAULT (2026-09-04), defaulting to min_samples because the two
+        # are the same statement made twice: a value must be held long enough to be measured the
+        # number of times the acceptance test requires. Set it to 0 to restore the no-dwell
+        # behaviour reps 2 to 7 ran, which is the ablation of this rule.
+        self._min_dwell = int(os.environ.get("DFOPTIMIZER_CBANDIT_MIN_DWELL",
+                                             str(self._min_samples)))
         self._last_move_window: Dict[str, int] = {}
         self._sample_window = int(os.environ.get("DFOPTIMIZER_CBANDIT_SAMPLE_WINDOW", "32"))
         # Set to 0 to disable the gate entirely and recover the previous behaviour exactly.
@@ -798,7 +804,12 @@ class CoordinateBanditPlanner:
                                 break
                             continue
                         accepted, cand_why = self._accept_move(cand_short, cand_cur, cand_choice)
-                        if accepted and self._min_dwell > 0:
+                        # NOT when the acceptance gate is disabled. DFOPTIMIZER_CBANDIT_ACCEPT=0
+                        # is the no-gate ablation and must recover the previous behaviour exactly;
+                        # the dwell floor exists to make the gate's evidence reachable, so applying
+                        # it with the gate off throttles the control arm and destroys the
+                        # comparison. Caught by C8, whose ungated arm stopped being able to thrash.
+                        if accepted and self._accept_enabled and self._min_dwell > 0:
                             held = completed - self._last_move_window.get(cand_short, -10**9)
                             if held < self._min_dwell:
                                 accepted, cand_why = False, "dwell:%d<%d" % (held, self._min_dwell)
