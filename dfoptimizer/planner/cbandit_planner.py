@@ -620,6 +620,7 @@ class CoordinateBanditPlanner:
                         r for r in ranked if r[1] != "input"]
 
             if ranked and ranked[0][1] not in actionable:
+                _bw = self._node_read_bandwidth(obs)
                 logger.info(
                     "optimizer.cbandit.decision", window=completed, decision="decline",
                     reason="dominant share of the step is unattributed",
@@ -628,6 +629,16 @@ class CoordinateBanditPlanner:
                     horizon_unit=obs.get("remaining_unit"), escalation_state="not_actionable",
                     unattributed=round(float(unattr), 4),
                     unattributed_frac=round(float(unattr) / wall, 3) if wall else None,
+                    # On the DECLINE record too, not only on a move. A cell where every window
+                    # declines -- 2 nodes, where compute is a sleep and owns no knob -- would
+                    # otherwise never show these, so the hop that carries them could not be
+                    # observed on the one shape cheap enough to verify it on. A measurement that
+                    # is only visible when the planner acts is not verifiable.
+                    node_read_gbs=(round(_bw, 4) if _bw is not None else None),
+                    node_read_busy_s=round(float(obs.get("node_read_busy_s") or 0.0), 4),
+                    node_read_bytes=float(obs.get("node_read_bytes") or 0.0),
+                    ceiling_gbs=self._lustre_ceiling_gbs or None,
+                    storage_suspect=storage_suspect,
                     domain_times={k: round(float(v), 4) for k, v in doms.items()},
                     wall=round(wall, 4))
                 ranked = []
