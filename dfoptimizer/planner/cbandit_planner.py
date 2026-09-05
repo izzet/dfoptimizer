@@ -229,6 +229,9 @@ class CoordinateBanditPlanner:
         # contained the bursts. If it exceeds the horizon the value is never characterised and the
         # planner stays on the incumbent rather than guessing.
         self._power = float(os.environ.get("DFOPTIMIZER_CBANDIT_POWER", "0.80"))
+        # Exploration needs a characterised incumbent (4s.20). Implemented, tested, DEFAULT OFF:
+        # it blocks cosmoflow's staging as well as unet3d's move, which is not what was asked for.
+        self._explore_gate = os.environ.get("DFOPTIMIZER_CBANDIT_EXPLORE_GATE", "0") == "1"
         self._epoch_wall_sum: float = 0.0
         self._epoch_wall_sq: float = 0.0
 
@@ -579,7 +582,8 @@ class CoordinateBanditPlanner:
         var = max((self._epoch_wall_sq - n * mean * mean) / (n - 1), 0.0)
         return mean, math.sqrt(var), n
 
-    def _within_arm_sigma(self, short: str) -> Optional[Tuple[float, float, int]]:
+    def _within_arm_sigma(self, short: str,
+                          value=None) -> Optional[Tuple[float, float, int]]:
         """(mean, pooled WITHIN-arm sigma, total n) over the sampled values of one knob.
 
         WHY NOT THE EPOCH'S TOTAL WALL SPREAD, which is what the decision as written asked for.
@@ -594,6 +598,12 @@ class CoordinateBanditPlanner:
         when no arm of this knob has two samples yet, which is the only case where there is nothing
         better to use.
         """
+        if value is not None:
+            own = list(self._samples.get((short, value), ()))
+            if len(own) >= 2:
+                m = sum(own) / len(own)
+                var = sum((x - m) ** 2 for x in own) / (len(own) - 1)
+                return m, math.sqrt(var), len(own)
         vs = [list(v) for (k, _lv), v in self._samples.items() if k == short and len(v) >= 2]
         if not vs:
             return None
@@ -612,7 +622,7 @@ class CoordinateBanditPlanner:
         return sum(allv) / len(allv), math.sqrt(num / den), tot
 
     def required_dwell(self, remaining: Optional[float] = None,
-                       short: Optional[str] = None) -> Tuple[int, dict]:
+                       short: Optional[str] = None, value=None) -> Tuple[int, dict]:
         """How many windows a value must be held to be worth testing, from the observed variance.
 
         Returns (dwell, why) where `why` carries the terms so a decision can be read back. The
@@ -626,7 +636,7 @@ class CoordinateBanditPlanner:
         which is the whole point: `neighbourhood_exhausted_no_help` may not be declared from a
         sample that could not have contained the cost (4s.17).
         """
-        st = self._within_arm_sigma(short) if short else None
+        st = self._within_arm_sigma(short, value) if short else None
         src = "within_arm"
         if st is None:
             st = self._epoch_wall_stats()
@@ -1121,12 +1131,44 @@ class CoordinateBanditPlanner:
         base = list(self._samples.get((short, current), ()))
         cand = list(self._samples.get((short, candidate), ()))
 
-        if len(cand) < self._min_samples:
-            return True, "explore_under_sampled"
-        if len(base) < self._min_samples:
-            # The arm we are ON is not yet characterised, so there is nothing to compare against.
-            # Staying costs nothing and earns the sample that makes the next comparison possible.
-            return False, "incumbent_under_sampled"
+        # EXPLORATION NEEDS A CHARACTERISED INCUMBENT (orchestrator, 2026-09-05, T3-0 4s.20).
+        #
+        # This check used to sit BELOW the exploration branch, so a move was admitted on the
+        # acquisition's say-so whenever the CANDIDATE was under-sampled, whatever was known about
+        # the value being left. On dev2 that let `read_threads 4 -> 1` through on a sample that
+        # could not measure 4, and 4s.18's dwell then made 1 unjudgeable for the rest of the run:
+        # the planner sat on an uncharacterised value it had never checked, which is a guess and
+        # not a decline.
+        #
+        # A planner that has not measured the noise of the value it HOLDS cannot compare anything
+        # against it, so it does not move. The bar is the same derived one: `n_required` from the
+        # incumbent's own within-arm sigma. On a smooth cell that is `min_samples` and nothing
+        # changes. On a bursty cell the incumbent is never characterised inside the horizon, no
+        # exploration is admitted, and the loop holds the shipped default for the run -- which is
+        # the honest result on unet3d: no knob effect is measurable within the run, so do not act.
+        #
+        # There is no first-move exemption. The first move has no predecessor, but it does have an
+        # incumbent, and that is what this asks about.
+        # DEFAULT OFF, and 4s.20 says why. The rule is right in principle and it fails its own
+        # acceptance condition on the cell it was required not to disturb: cosmoflow's WITHIN-RUN
+        # window walls run 13.5 to 38.1 s, a 43 percent spread, so `n_required` is about 3625
+        # against 74 windows and its window-2 stage is blocked too. The 1.3 percent figure the
+        # decision relied on is the steady-state spread ACROSS REPS, not the window-to-window
+        # spread the power calculation needs. Enable with DFOPTIMIZER_CBANDIT_EXPLORE_GATE=1.
+        if self._explore_gate:
+            need, _why = self.required_dwell(short=short, value=current)
+            if len(base) < need:
+                return False, ("incumbent_under_sampled" if len(base) < self._min_samples
+                               else "incumbent_under_powered:%d<%d" % (len(base), need))
+            if len(cand) < self._min_samples:
+                return True, "explore_under_sampled"
+        else:
+            # GATE OFF is the deployed default and must reproduce the previous order exactly:
+            # an under-sampled CANDIDATE is explored before anything is asked about the incumbent.
+            if len(cand) < self._min_samples:
+                return True, "explore_under_sampled"
+            if len(base) < self._min_samples:
+                return False, "incumbent_under_sampled"
 
         verdict = accept_decision(base, cand,
                                   alpha=self._alpha, effect_floor=self._effect_floor)
