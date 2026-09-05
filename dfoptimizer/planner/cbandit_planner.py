@@ -232,6 +232,10 @@ class CoordinateBanditPlanner:
         # Exploration needs a characterised incumbent (4s.20). Implemented, tested, DEFAULT OFF:
         # it blocks cosmoflow's staging as well as unet3d's move, which is not what was asked for.
         self._explore_gate = os.environ.get("DFOPTIMIZER_CBANDIT_EXPLORE_GATE", "0") == "1"
+        # The derived dwell applied to the ESCALATION verdict, which decides whether a costlier
+        # actuator may be reached. Default off for the reason in _escalation_state.
+        self._power_escalation = os.environ.get(
+            "DFOPTIMIZER_CBANDIT_POWER_ESCALATION", "0") == "1"
         self._epoch_wall_sum: float = 0.0
         self._epoch_wall_sq: float = 0.0
 
@@ -1078,7 +1082,12 @@ class CoordinateBanditPlanner:
         # three-window samples, on a cell where the cost of that value appears in one window in six
         # and lasts longer than the sample. `exhausted` is a strong claim and it may not be made
         # from evidence that is under-powered for the effect the test is looking for.
-        need, _why = self.required_dwell(short=short)
+        # DEFAULT OFF (4s.21). This breaks the escalation loop, and the escalation loop is how a
+        # storage candidate is reached at all, so an under-powered cheaper knob can silently remove
+        # the cosmoflow stage. Until `delta`'s meaning is settled, nothing on by default may be able
+        # to do that. Enable with DFOPTIMIZER_CBANDIT_POWER_ESCALATION=1.
+        need = (self.required_dwell(short=short)[0] if self._power_escalation
+                else self._min_samples)
         base = list(self._samples.get((short, current), ()))
         if len(base) < need:
             return False, ("incumbent_under_sampled" if len(base) < self._min_samples
