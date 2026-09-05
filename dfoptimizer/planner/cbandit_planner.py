@@ -474,7 +474,12 @@ class CoordinateBanditPlanner:
             self._epoch_windows = 0
             self._epoch_dropped = False
             self._drops_at_epoch_start = self._ring_drops()
-        self._epoch_bytes += max(float(node_read_bytes or 0.0), 0.0)
+        # GB, NOT BYTES. `node_read_bytes` is raw bytes and every priced quantity downstream is in
+        # GB, because `_node_read_bandwidth` returns `(by / 1e9) / wall`. Accumulating raw bytes
+        # here made `un_loop_n8_10e_dev2` derive a cost of 1.15e12 s and refuse every relocation
+        # for the wrong reason (T3-0 4s.9): the right answer produced by a broken price, which is
+        # worse than a wrong answer because it looks like the rule working.
+        self._epoch_bytes += max(float(node_read_bytes or 0.0), 0.0) / 1e9
         self._epoch_windows += 1
         now = self._ring_drops()
         if now is not None:
