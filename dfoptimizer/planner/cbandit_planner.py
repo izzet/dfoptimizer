@@ -202,6 +202,14 @@ class CoordinateBanditPlanner:
         self._epoch_dropped: bool = False
         self._drops_at_epoch_start: Optional[int] = None
         self._drop_probe = None
+        # The node's OWN observed read rate, at the same epoch-to-date scale as the bytes, because
+        # the physical price needs both. Accumulated as a mean of the per-window rates rather than
+        # as epoch bytes over epoch WALL: the wall on unet3d is 70.7 percent barrier (T3-0 4s.13),
+        # and dividing bytes by it charges barrier time to reading, which understates the source
+        # rate and inflates the gain by construction on exactly the cell where reading is off the
+        # critical path. Measured: the two forms give 0 and 51 payable windows on the same records.
+        self._epoch_bw_sum: float = 0.0
+        self._epoch_bw_n: int = 0
 
     # --- Planner-compatible registration (identical contract to Planner/CLBOPlanner) ---
     def register_knobs(self, knob_defs, current_values=None):
@@ -377,7 +385,12 @@ class CoordinateBanditPlanner:
         epoch_key = m.get("epoch")
         if epoch_key is None and wpe:
             epoch_key = int(window // float(wpe))
-        self._note_epoch(epoch_key, m.get("node_read_bytes", 0.0))
+        self._note_epoch(epoch_key, m.get("node_read_bytes", 0.0),
+                         self._node_read_bandwidth({
+                             "node_read_bytes": m.get("node_read_bytes", 0.0),
+                             "node_read_bytes_any": m.get("node_read_bytes_any", 0.0),
+                             "node_read_busy_s": m.get("node_read_busy_s", 0.0),
+                             "wall": float(wall)}))
         return {
             "cfg": dict(self._planned_cfg.get(window, self._short_cfg())),
             "domains": domains,
@@ -397,6 +410,7 @@ class CoordinateBanditPlanner:
             "epoch": epoch_key,
             "epoch_windows": self._epoch_windows,
             "epoch_bytes_per_window": self._epoch_bytes_per_window(),
+            "epoch_src_gbs": self._epoch_src_gbs(),
             "epoch_dropped": self._epoch_dropped,
             "drops_known": self._drops_at_epoch_start is not None,
         }
@@ -466,12 +480,14 @@ class CoordinateBanditPlanner:
         except Exception:                          # noqa: BLE001
             return None
 
-    def _note_epoch(self, obs_epoch, node_read_bytes) -> None:
+    def _note_epoch(self, obs_epoch, node_read_bytes, node_read_gbs=None) -> None:
         """Accumulate this window's bytes into the current epoch, and reset on an epoch change."""
         if obs_epoch != self._epoch_key:
             self._epoch_key = obs_epoch
             self._epoch_bytes = 0.0
             self._epoch_windows = 0
+            self._epoch_bw_sum = 0.0
+            self._epoch_bw_n = 0
             self._epoch_dropped = False
             self._drops_at_epoch_start = self._ring_drops()
         # GB, NOT BYTES. `node_read_bytes` is raw bytes and every priced quantity downstream is in
@@ -480,6 +496,9 @@ class CoordinateBanditPlanner:
         # for the wrong reason (T3-0 4s.9): the right answer produced by a broken price, which is
         # worse than a wrong answer because it looks like the rule working.
         self._epoch_bytes += max(float(node_read_bytes or 0.0), 0.0) / 1e9
+        if node_read_gbs:
+            self._epoch_bw_sum += float(node_read_gbs)
+            self._epoch_bw_n += 1
         self._epoch_windows += 1
         now = self._ring_drops()
         if now is not None:
@@ -491,6 +510,57 @@ class CoordinateBanditPlanner:
                 self._drops_at_epoch_start = now
             elif now > base:
                 self._epoch_dropped = True
+
+    def _epoch_src_gbs(self) -> Optional[float]:
+        """The node's observed read rate over this epoch so far, GB/s, or None if unusable.
+
+        Same three refusals as `_epoch_bytes_per_window`, for the same reasons: an epoch that lost
+        records did not observe the reads it thinks it did, and fewer than `min_samples` windows is
+        a window rather than an epoch.
+        """
+        if self._epoch_dropped:
+            return None
+        if self._epoch_windows < self._min_samples:
+            return None
+        if self._epoch_bw_n <= 0 or self._epoch_bw_sum <= 0.0:
+            return None
+        return self._epoch_bw_sum / float(self._epoch_bw_n)
+
+    def _relocation_gain_per_window(self, bytes_per_window, src_gbs,
+                                    exposed_s) -> Optional[float]:
+        """What a relocation PHYSICALLY does: it changes the time the readers spend reading.
+
+        Orchestrator decision, 2026-09-05, after T3-0 4s.13 showed the previous form assumed that
+        everything above the floor was relievable by moving the data, which is the hidden assumption
+        that the barrier IS storage. It held on cosmoflow and it did not on unet3d, where the
+        measured input domain is 3 ms of a 4 s window and the wall correlates with comm at 1.0000.
+
+            gain = bytes_per_window x (1 / src_gbs - 1 / dest_gbs)      clamped at 0
+            gain = min(gain, input + comm)                              nothing saves more than
+                                                                        the exposed time
+
+        Two measured rates and a byte count, no constant chosen to make a cell fail and no share of
+        the wall below which a domain is ignored. It refuses BY ARITHMETIC when the destination is
+        not faster than the source, which is the case on unet3d: the node already reads at about
+        3.69 GB/s against a 3.300 GB/s local ceiling.
+
+        Checked against both recorded cells before deployment (4s.14): predicted 11.39, 11.58 and
+        11.92 s per window on the three cosmoflow dwell reps against a realised 11.50, 11.51 and
+        11.51, and 0.4024 s per window on unet3d against a realised 0.6602 -- accepting where the
+        stage paid and refusing in all 305 candidate windows where it did not.
+
+        Returns None when either rate or the byte count is missing, which the caller treats the way
+        it treats a missing horizon: a positive-cost relocation is declined and nothing is invented.
+        """
+        if not bytes_per_window or bytes_per_window <= 0:
+            return None
+        if not src_gbs or src_gbs <= 0 or self._dest_read_gbs <= 0:
+            return None
+        gain = float(bytes_per_window) * (1.0 / float(src_gbs) - 1.0 / self._dest_read_gbs)
+        gain = max(gain, 0.0)
+        if exposed_s is not None:
+            gain = min(gain, max(float(exposed_s), 0.0))
+        return gain
 
     def _epoch_bytes_per_window(self) -> Optional[float]:
         """Mean bytes this node read per window so far this epoch, or None if it may not be used.
@@ -1034,6 +1104,9 @@ class CoordinateBanditPlanner:
                     cfg_now = self._short_cfg()
                     short, cur, choice, detail, why = None, None, None, [], "no_change"
                     tried = []
+                    # The relocation's predicted per-window gain, kept across the candidate loop so
+                    # the decision record carries the prediction the run was made on (dev3).
+                    reloc_gain_last = None
                     for cand_short in order:
                         cand_cur = cfg_now[cand_short]
                         # THE EXPOSURE A STORAGE ACTUATOR CAN RELIEVE, in a storage-suspect
@@ -1058,12 +1131,13 @@ class CoordinateBanditPlanner:
                         if storage_suspect and cand_short in promoted:
                             cand_exposed = float(doms.get("input", 0.0)) + float(
                                 doms.get("comm", 0.0))
-                        # AND THEN BOUNDED BY THE DESTINATION, for a knob that RELOCATES the bytes.
-                        # input+comm is what a relocation may be CREDITED with at most; what it can
-                        # actually deliver is set by the device it moves the data to. See
-                        # _destination_bounded_gain for the two measurements that forced this.
-                        # A relocating knob with no destination rate and no bandwidth reading gets
-                        # a cap of zero rather than the looser bound, so it is declined.
+                        # AND THEN PRICED PHYSICALLY, for a knob that RELOCATES the bytes.
+                        # input+comm is what a relocation may be CREDITED with at most, and it is
+                        # a BOUND rather than the gain: what the move actually delivers is the
+                        # change in the time the readers spend reading, two measured rates and a
+                        # byte count. See _relocation_gain_per_window. A relocating knob with no
+                        # epoch-scale byte count or source rate gets zero rather than a looser
+                        # bound, so it is declined.
                         cand_cost_override = None
                         if cand_short in self._relocating:
                             # The bound applies in EVERY window, not only under the barrier
@@ -1075,12 +1149,11 @@ class CoordinateBanditPlanner:
                             # declined -- the same discipline as a missing horizon or destination
                             # rate, and the answer 4s.8 says the single-window form got wrong.
                             reloc_bytes = obs.get("epoch_bytes_per_window")
-                            reloc_bw = (suspect_bw if suspect_bw is not None
-                                        else self._node_read_bandwidth(obs))
-                            dest_cap = self._destination_bounded_gain(
-                                obs.get("wall"), doms.get("compute", 0.0), None,
-                                bytes_per_window=reloc_bytes)
-                            cand_exposed = 0.0 if dest_cap is None else min(cand_exposed, dest_cap)
+                            reloc_src = obs.get("epoch_src_gbs")
+                            phys = self._relocation_gain_per_window(
+                                reloc_bytes, reloc_src, cand_exposed)
+                            reloc_gain_last = phys
+                            cand_exposed = 0.0 if phys is None else phys
                             cand_cost_override = self._relocation_cost_s(
                                 cand_short, None, obs, None,
                                 bytes_per_window=reloc_bytes)
@@ -1163,6 +1236,11 @@ class CoordinateBanditPlanner:
                                 # 4s.8's staging looked identical in the log to a sound one.
                                 epoch=obs.get("epoch"),
                                 epoch_windows=obs.get("epoch_windows"),
+                                # The physical price's own three inputs and its prediction, so a
+                                # staging decision can be read back without re-deriving it.
+                                epoch_src_gbs=_rounded(obs.get("epoch_src_gbs")),
+                                dest_read_gbs=self._dest_read_gbs or None,
+                                reloc_gain_per_window=_rounded(reloc_gain_last),
                                 epoch_bytes_per_window=_rounded(
                                     obs.get("epoch_bytes_per_window")),
                                 epoch_dropped=obs.get("epoch_dropped"),
