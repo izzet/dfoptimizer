@@ -24,6 +24,7 @@ def knob(
     cost_seconds: float = 0.0,
     requires_unanimity: bool = False,
     changes_regime: bool = False,
+    relocates_data: bool = False,
 ) -> dict:
     """Helper to declare a knob in @tunable.
 
@@ -47,6 +48,7 @@ def knob(
         "cost_seconds": cost_seconds,
         "requires_unanimity": requires_unanimity,
         "changes_regime": changes_regime,
+        "relocates_data": relocates_data,
     }
 
 
@@ -76,6 +78,7 @@ def knob_def_from_dict(knob_id: str, d: dict, target_function: str = "") -> Knob
         cost_seconds=_coerce_cost(d.get("cost_seconds", 0.0)),
         requires_unanimity=bool(d.get("requires_unanimity", False)),
         changes_regime=bool(d.get("changes_regime", False)),
+        relocates_data=bool(d.get("relocates_data", False)),
         responds_to=responds_to,
         target_function=target_function,
     )
@@ -109,6 +112,7 @@ def knob_def_to_wire(kdef: KnobDef) -> dict:
         "cost_seconds": kdef.cost_seconds,
         "requires_unanimity": kdef.requires_unanimity,
         "changes_regime": kdef.changes_regime,
+        "relocates_data": kdef.relocates_data,
     }
 
 
@@ -141,6 +145,7 @@ def knob_def_from_wire(d: dict) -> KnobDef:
         cost_seconds=_coerce_cost(d.get("cost_seconds", 0.0)),
         requires_unanimity=bool(d.get("requires_unanimity", False)),
         changes_regime=bool(d.get("changes_regime", False)),
+        relocates_data=bool(d.get("relocates_data", False)),
         responds_to=responds_to,
         target_function=d.get("target_function", ""),
     )

@@ -194,6 +194,8 @@ class Optimizer:
                                      "restriped": restripe_cost},
                     # Moving the bytes moves the objective into another regime; see KnobDef.
                     "changes_regime": True,
+                    # And it moves them to a device whose rate bounds the gain; see 4s.
+                    "relocates_data": True,
                     "responds_to": {
                         "storage_starved": {
                             "direction": "set",

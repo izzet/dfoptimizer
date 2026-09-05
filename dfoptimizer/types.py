@@ -142,6 +142,14 @@ class KnobDef:
     # inferred from a cost or a name: only the knob knows that its action relocates the bytes.
     changes_regime: bool = False
 
+    # True when moving this knob RELOCATES the bytes to a different device, so its gain is bounded
+    # by what that device can deliver and its cost scales with how much there is to move. Measured
+    # (T3-0 section 4s): the same price cleared staging on cosmoflow, where the node read Lustre at
+    # 0.71 GB/s and moved to an SSD delivering about 2.05, and on unet3d, where the node was already
+    # reading at 2.89 to 3.36 GB/s and moved to a slower device and lost. Nothing the rule looked at
+    # separated them, because it asked only how bad the SOURCE was.
+    relocates_data: bool = False
+
     def cost_for(self, value=None) -> float:
         """Cost of moving this knob TO `value`.
 

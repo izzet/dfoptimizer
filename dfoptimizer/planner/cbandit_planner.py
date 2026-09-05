@@ -170,6 +170,14 @@ class CoordinateBanditPlanner:
         # so the acceptance gate never stops it, so it absorbs the escalation forever.
         self._retire_after = int(os.environ.get("DFOPTIMIZER_CBANDIT_RETIRE_AFTER", "3"))
         self._rejections: Dict[str, int] = {}
+        # THE DESTINATION, which until 2026-09-04 was never asked about. See
+        # _destination_bounded_gain. Both are measured per-cluster capacities with provenance, of
+        # the same kind as the Lustre ceiling, and both are unset-safe: with no rate the planner
+        # declines a positive-cost relocation rather than inventing one, exactly as the horizon
+        # contract does with a missing horizon.
+        self._dest_read_gbs = _envf("LOCAL_READ_CEILING_GBS")
+        self._stage_rate_gbs = _envf("LIVEFLOW_STAGE_RATE_GBS")
+        self._relocating: set = set()
 
     # --- Planner-compatible registration (identical contract to Planner/CLBOPlanner) ---
     def register_knobs(self, knob_defs, current_values=None):
@@ -191,9 +199,17 @@ class CoordinateBanditPlanner:
                 self._regime_knobs.add(short)
             else:
                 self._regime_knobs.discard(short)
+            # A knob that RELOCATES the bytes is priced against where it puts them.
+            if getattr(kd, "relocates_data", False):
+                self._relocating.add(short)
+            else:
+                self._relocating.discard(short)
         logger.info("optimizer.cbandit.registered",
                     knobs=list(self._short.values()),
                     regime_knobs=sorted(self._regime_knobs),
+                    relocating_knobs=sorted(self._relocating),
+                    dest_read_gbs=self._dest_read_gbs or None,
+                    stage_rate_gbs=self._stage_rate_gbs or None,
                     domains={s: self._domain[s] for s in self._short.values()},
                     levels={s: self._levels[s] for s in self._short.values()})
 
@@ -343,6 +359,8 @@ class CoordinateBanditPlanner:
             "node_read_busy_s": float(m.get("node_read_busy_s", 0.0) or 0.0),
             # Diagnostic only; see the note in dlio-signal.yaml.
             "node_read_bytes_any": float(m.get("node_read_bytes_any", 0.0) or 0.0),
+            # For the derived cost of a relocation: how many windows of these bytes make an epoch.
+            "windows_per_epoch": _num_or_none(m.get("windows_per_epoch")),
         }
 
     @staticmethod
@@ -383,6 +401,68 @@ class CoordinateBanditPlanner:
             buf.append(float(wall))
         self._total_pulls += 1
 
+    def _destination_bounded_gain(self, wall_s, compute_s, bw_gbs) -> Optional[float]:
+        """Per-window gain a RELOCATION may be priced at, bounded by where the bytes are going.
+
+        THE DECISION THIS FIXES, measured on both sides. `un_loop_n8_10e_r1` staged on all eight
+        nodes at window 15 with a predicted 1239 to 1549 s against a declared 465, the copy took
+        936 to 956 s and bought about 38 s per epoch, and over ten epochs the loop would have run
+        about 2840 s against Original's 1930 (T3-0 section 4s). `cf_loop_n32_r8` made the same kind
+        of decision and won, 412 s per epoch becoming 134.
+
+        NOTHING THE RULE LOOKED AT SEPARATED THEM. Both were at_ceiling, both had comm dominant with
+        no comm knob, both had a tiny input domain. The ceiling comparison asks how bad the SOURCE
+        is and the answer was "saturated" in both cases. What differs is the DESTINATION: the
+        cosmoflow node was reading Lustre at 0.71 GB/s and moving to an SSD that delivers about
+        2.05, while the unet3d node was already reading at 2.89 to 3.36 GB/s and moving to a
+        SLOWER device.
+
+        After a relocation the window cannot be shorter than the time the destination needs to
+        deliver the bytes, nor shorter than the compute still to be done. Those two overlap in a
+        pipelined loader, so the post-move window is their max and not their sum:
+
+            bytes           = node_read_gbs * wall
+            post_move_input = bytes / dest_read_gbs
+            gain            = max(wall - max(compute, post_move_input), 0)
+
+        On cosmoflow that is 10.69 s per window against a realised 11.58, where the deployed
+        input+comm cap said 7.45. On unet3d it is exactly 0 on all eight agents. In one sentence:
+        do not move the data to a device slower than the one you are already achieving, whatever
+        comm says.
+
+        Returns None when the destination rate or the bandwidth reading is missing, and the caller
+        must then decline a positive-cost relocation rather than fall back to a looser bound.
+        """
+        if self._dest_read_gbs <= 0 or bw_gbs is None or not wall_s or wall_s <= 0:
+            return None
+        read_bytes = float(bw_gbs) * float(wall_s)
+        post_move_input = read_bytes / self._dest_read_gbs
+        return max(float(wall_s) - max(float(compute_s or 0.0), post_move_input), 0.0)
+
+    def _relocation_cost_s(self, short: str, value, obs: dict, bw_gbs) -> Optional[float]:
+        """What the copy costs on THIS cell, rather than a constant measured on another one.
+
+        465 s was measured moving 285 GB per node on cosmoflow at 32 nodes and was then applied
+        unchanged to unet3d's 438 GB per node, where the copy actually took 936 to 956 s. The bytes
+        are observable: this node read `bw * wall` in a window and `windows_per_epoch` of them make
+        an epoch, which is one pass over its shard.
+
+        The stage rate is itself scale dependent, 0.61 GB/s for one node's share at 32 nodes
+        against 0.46 GB/s at 8 nodes each copying 438 GB, so it wants the same
+        min(single, aggregate/N) treatment the Lustre ceiling has. Until that is measured this uses
+        one configured rate and says so in the record.
+        """
+        if short not in self._relocating or self._stage_rate_gbs <= 0:
+            return None
+        if bw_gbs is None:
+            return None
+        wpe = obs.get("windows_per_epoch")
+        wall = obs.get("wall")
+        if not wpe or not wall:
+            return None
+        bytes_per_node = float(bw_gbs) * float(wall) * float(wpe)
+        return bytes_per_node / self._stage_rate_gbs
+
     def _neighbourhood(self, short: str, current) -> List:
         """{stay, one level down, one level up} -- a coordinate step, not a global jump."""
         levels = self._levels.get(short) or [current]
@@ -399,7 +479,7 @@ class CoordinateBanditPlanner:
         return out
 
     def _pick(self, short: str, current, domain: str, exposed_s: Optional[float] = None,
-              remaining: Optional[float] = None):
+              remaining: Optional[float] = None, cost_override: Optional[float] = None):
         """UCB over the neighbourhood in remaining-run wall seconds.
 
         An unpulled arm gets the best observed wall as an optimistic prior rather than -inf, so a
@@ -446,6 +526,10 @@ class CoordinateBanditPlanner:
                 # made, including COST_W=0 and knobs declared with zero cost.
                 bonus = 0.0
             cost_s = 0.0 if lv == current else self._move_cost(short, lv)
+            # A cost derived from the bytes THIS cell moves replaces the declared constant when it
+            # is computable, and is recorded as such so a decision can be read back.
+            if lv != current and cost_override is not None and cost_override > 0.0:
+                cost_s = float(cost_override)
             weighted_cost_s = self._cost_w * cost_s
             gain_per_window_s = max(cur_mean - (mean - bonus), 0.0)
             if exposed_s is not None:
@@ -821,9 +905,27 @@ class CoordinateBanditPlanner:
                         if storage_suspect and cand_short in promoted:
                             cand_exposed = float(doms.get("input", 0.0)) + float(
                                 doms.get("comm", 0.0))
+                        # AND THEN BOUNDED BY THE DESTINATION, for a knob that RELOCATES the bytes.
+                        # input+comm is what a relocation may be CREDITED with at most; what it can
+                        # actually deliver is set by the device it moves the data to. See
+                        # _destination_bounded_gain for the two measurements that forced this.
+                        # A relocating knob with no destination rate and no bandwidth reading gets
+                        # a cap of zero rather than the looser bound, so it is declined.
+                        cand_cost_override = None
+                        if cand_short in self._relocating:
+                            # The bound applies in EVERY window, not only under the barrier
+                            # redirect: a relocation is limited by its destination whether the
+                            # dominant domain is comm or input.
+                            reloc_bw = (suspect_bw if suspect_bw is not None
+                                        else self._node_read_bandwidth(obs))
+                            dest_cap = self._destination_bounded_gain(
+                                obs.get("wall"), doms.get("compute", 0.0), reloc_bw)
+                            cand_exposed = 0.0 if dest_cap is None else min(cand_exposed, dest_cap)
+                            cand_cost_override = self._relocation_cost_s(
+                                cand_short, None, obs, reloc_bw)
                         cand_choice, cand_detail = self._pick(
                             cand_short, cand_cur, dom, exposed_s=cand_exposed,
-                            remaining=obs.get("remaining"))
+                            remaining=obs.get("remaining"), cost_override=cand_cost_override)
                         if cand_choice == cand_cur:
                             may_escalate, esc_state = self._escalation_state(cand_short, cand_cur)
                             tried.append({"knob": cand_short, "verdict": "stay",
@@ -984,6 +1086,17 @@ def _num(v):
         return float(v)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _num_or_none(v):
+    """A metric that is absent stays absent. Coercing it to 0 would price a relocation on a corpus
+    of no bytes, which is the failure mode the horizon contract already refuses for the horizon."""
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
 
 
 def _rounded(value):
