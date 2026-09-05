@@ -178,6 +178,30 @@ class CoordinateBanditPlanner:
         self._dest_read_gbs = _envf("LOCAL_READ_CEILING_GBS")
         self._stage_rate_gbs = _envf("LIVEFLOW_STAGE_RATE_GBS")
         self._relocating: set = set()
+        # THE EPOCH-TO-DATE BYTE RATE, and why a relocation may not be priced from one window.
+        #
+        # `un_loop_n8_10e_dev1` staged on all eight nodes at window 122 (T3-0 4s.8). Every agent
+        # read 0.05 to 0.22 GB/s in THAT window against a 2.2975 GB/s ceiling and a ~2.3 GB/s epoch
+        # mean, because the window was comm-dominated and, on that run, because the ring was
+        # dropping 40% of the trace records. One low reading moved BOTH sides of the price the way
+        # that pays: the derived cost fell to 58-241 s for a copy that took 913-948 s, and the
+        # destination bound went vacuous, because a device only has to beat a source that is
+        # reading nothing.
+        #
+        # A relocation moves an EPOCH's worth of bytes, so it is priced from an epoch's worth of
+        # observation: the mean bytes this node read per window, over the windows of the current
+        # epoch seen so far. More samples, no new constant. The floor on how many windows is
+        # `min_samples`, already the planner's threshold for calling an arm characterised.
+        self._epoch_key: Optional[object] = None
+        self._epoch_bytes: float = 0.0
+        self._epoch_windows: int = 0
+        # An epoch that lost trace records did not observe the bytes it thinks it did, so it may
+        # not price a relocation at all. `_drop_probe` is injected in tests and read from the
+        # in-process ring reader otherwise; None means the question could not be asked, which is
+        # recorded rather than assumed to be a zero.
+        self._epoch_dropped: bool = False
+        self._drops_at_epoch_start: Optional[int] = None
+        self._drop_probe = None
 
     # --- Planner-compatible registration (identical contract to Planner/CLBOPlanner) ---
     def register_knobs(self, knob_defs, current_values=None):
@@ -346,6 +370,14 @@ class CoordinateBanditPlanner:
         # a threshold -- no constant says how much unexplained time is "too much".
         unattributed = max(float(wall) - sum(domains.values()), 0.0)
         remaining, remaining_unit = self._remaining_run(m)
+        # WHICH EPOCH THIS WINDOW BELONGS TO. Preferred from the analyzer's own stamp; derived from
+        # the cadence when it is absent, which it is on some presets. Either way the accumulator
+        # only needs a key that changes when the epoch does.
+        wpe = _num_or_none(m.get("windows_per_epoch"))
+        epoch_key = m.get("epoch")
+        if epoch_key is None and wpe:
+            epoch_key = int(window // float(wpe))
+        self._note_epoch(epoch_key, m.get("node_read_bytes", 0.0))
         return {
             "cfg": dict(self._planned_cfg.get(window, self._short_cfg())),
             "domains": domains,
@@ -361,6 +393,12 @@ class CoordinateBanditPlanner:
             "node_read_bytes_any": float(m.get("node_read_bytes_any", 0.0) or 0.0),
             # For the derived cost of a relocation: how many windows of these bytes make an epoch.
             "windows_per_epoch": _num_or_none(m.get("windows_per_epoch")),
+            # Epoch-scale observation of the same bytes; see _epoch_bytes_per_window.
+            "epoch": epoch_key,
+            "epoch_windows": self._epoch_windows,
+            "epoch_bytes_per_window": self._epoch_bytes_per_window(),
+            "epoch_dropped": self._epoch_dropped,
+            "drops_known": self._drops_at_epoch_start is not None,
         }
 
     @staticmethod
@@ -401,7 +439,75 @@ class CoordinateBanditPlanner:
             buf.append(float(wall))
         self._total_pulls += 1
 
-    def _destination_bounded_gain(self, wall_s, compute_s, bw_gbs) -> Optional[float]:
+    def _ring_drops(self) -> Optional[int]:
+        """Cumulative trace records lost by the ring, or None if it cannot be asked.
+
+        The optimizer stage runs in the same process as the ring reader (`node_agent.py`), so this
+        is a local read and not a new hop. Off-cluster and in tests there is no ring, and None is
+        the honest answer: the planner records `drops_unknown` rather than treating "I could not
+        look" as "there were none".
+        """
+        if self._drop_probe is not None:
+            try:
+                return int(self._drop_probe())
+            except Exception:                      # noqa: BLE001
+                return None
+        try:
+            from liveflow_transport import shm_io as _io      # noqa: PLC0415
+            totals = _io.ring_totals() or {}
+        except Exception:                          # noqa: BLE001
+            return None
+        got = totals.get("trace")
+        if not got:
+            return None
+        # (written, dropped, unclaimed); `dropped` already includes `unclaimed` via Reader.totals.
+        try:
+            return int(got[1])
+        except Exception:                          # noqa: BLE001
+            return None
+
+    def _note_epoch(self, obs_epoch, node_read_bytes) -> None:
+        """Accumulate this window's bytes into the current epoch, and reset on an epoch change."""
+        if obs_epoch != self._epoch_key:
+            self._epoch_key = obs_epoch
+            self._epoch_bytes = 0.0
+            self._epoch_windows = 0
+            self._epoch_dropped = False
+            self._drops_at_epoch_start = self._ring_drops()
+        self._epoch_bytes += max(float(node_read_bytes or 0.0), 0.0)
+        self._epoch_windows += 1
+        now = self._ring_drops()
+        if now is not None:
+            # Any loss since this epoch began contaminates it. A drop that happened in an earlier
+            # epoch is not this epoch's problem, which is why the baseline is taken at the reset
+            # and not compared against zero.
+            base = self._drops_at_epoch_start
+            if base is None:
+                self._drops_at_epoch_start = now
+            elif now > base:
+                self._epoch_dropped = True
+
+    def _epoch_bytes_per_window(self) -> Optional[float]:
+        """Mean bytes this node read per window so far this epoch, or None if it may not be used.
+
+        None for three distinct reasons, all of which the caller must treat as "do not price a
+        positive-cost relocation", the same discipline the horizon contract has:
+
+          * fewer than `min_samples` windows of this epoch seen, so there is no epoch-scale
+            observation yet, only a window;
+          * the epoch recorded ring drops, so its byte total is a floor and not a measurement;
+          * no bytes at all, which is an absence and not a rate of zero.
+        """
+        if self._epoch_dropped:
+            return None
+        if self._epoch_windows < self._min_samples:
+            return None
+        if self._epoch_bytes <= 0.0:
+            return None
+        return self._epoch_bytes / float(self._epoch_windows)
+
+    def _destination_bounded_gain(self, wall_s, compute_s, bw_gbs,
+                                  bytes_per_window=None) -> Optional[float]:
         """Per-window gain a RELOCATION may be priced at, bounded by where the bytes are going.
 
         THE DECISION THIS FIXES, measured on both sides. `un_loop_n8_10e_r1` staged on all eight
@@ -433,13 +539,22 @@ class CoordinateBanditPlanner:
         Returns None when the destination rate or the bandwidth reading is missing, and the caller
         must then decline a positive-cost relocation rather than fall back to a looser bound.
         """
-        if self._dest_read_gbs <= 0 or bw_gbs is None or not wall_s or wall_s <= 0:
+        if self._dest_read_gbs <= 0 or not wall_s or wall_s <= 0:
             return None
-        read_bytes = float(bw_gbs) * float(wall_s)
+        # The bytes are taken from the EPOCH when an epoch-scale reading exists, and a relocation
+        # is not priced at all when it does not. `bw_gbs x wall` remains the definition for every
+        # non-relocating use of this helper and for the unit cases that state the formula itself.
+        if bytes_per_window is not None:
+            read_bytes = float(bytes_per_window)
+        elif bw_gbs is not None:
+            read_bytes = float(bw_gbs) * float(wall_s)
+        else:
+            return None
         post_move_input = read_bytes / self._dest_read_gbs
         return max(float(wall_s) - max(float(compute_s or 0.0), post_move_input), 0.0)
 
-    def _relocation_cost_s(self, short: str, value, obs: dict, bw_gbs) -> Optional[float]:
+    def _relocation_cost_s(self, short: str, value, obs: dict, bw_gbs,
+                           bytes_per_window=None) -> Optional[float]:
         """What the copy costs on THIS cell, rather than a constant measured on another one.
 
         465 s was measured moving 285 GB per node on cosmoflow at 32 nodes and was then applied
@@ -454,13 +569,20 @@ class CoordinateBanditPlanner:
         """
         if short not in self._relocating or self._stage_rate_gbs <= 0:
             return None
-        if bw_gbs is None:
-            return None
         wpe = obs.get("windows_per_epoch")
         wall = obs.get("wall")
         if not wpe or not wall:
             return None
-        bytes_per_node = float(bw_gbs) * float(wall) * float(wpe)
+        # One epoch's bytes, from an epoch's worth of windows. The single-window form is kept only
+        # for the unit cases that state the formula, because it is what produced a 58 s estimate of
+        # a 945 s copy (4s.8).
+        if bytes_per_window is not None:
+            per_window = float(bytes_per_window)
+        elif bw_gbs is not None:
+            per_window = float(bw_gbs) * float(wall)
+        else:
+            return None
+        bytes_per_node = per_window * float(wpe)
         return bytes_per_node / self._stage_rate_gbs
 
     def _neighbourhood(self, short: str, current) -> List:
@@ -916,13 +1038,21 @@ class CoordinateBanditPlanner:
                             # The bound applies in EVERY window, not only under the barrier
                             # redirect: a relocation is limited by its destination whether the
                             # dominant domain is comm or input.
+                            # PRICED FROM THE EPOCH, NEVER FROM THIS WINDOW, and not at all from
+                            # an epoch that lost records. With no epoch-scale reading the cap is
+                            # zero and the derived cost is absent, so a positive-cost relocation is
+                            # declined -- the same discipline as a missing horizon or destination
+                            # rate, and the answer 4s.8 says the single-window form got wrong.
+                            reloc_bytes = obs.get("epoch_bytes_per_window")
                             reloc_bw = (suspect_bw if suspect_bw is not None
                                         else self._node_read_bandwidth(obs))
                             dest_cap = self._destination_bounded_gain(
-                                obs.get("wall"), doms.get("compute", 0.0), reloc_bw)
+                                obs.get("wall"), doms.get("compute", 0.0), None,
+                                bytes_per_window=reloc_bytes)
                             cand_exposed = 0.0 if dest_cap is None else min(cand_exposed, dest_cap)
                             cand_cost_override = self._relocation_cost_s(
-                                cand_short, None, obs, reloc_bw)
+                                cand_short, None, obs, None,
+                                bytes_per_window=reloc_bytes)
                         cand_choice, cand_detail = self._pick(
                             cand_short, cand_cur, dom, exposed_s=cand_exposed,
                             remaining=obs.get("remaining"), cost_override=cand_cost_override)
@@ -996,6 +1126,15 @@ class CoordinateBanditPlanner:
                                 knob=short, current=cur, chose=choice,
                                 accept=why, escalation=tried,
                                 gain_s=gain_s, cost_s=round(cost_s, 3),
+                                # The epoch-scale reading a relocation was priced from, and whether
+                                # it was usable. Without these a decision cannot be read back:
+                                # 4s.8's staging looked identical in the log to a sound one.
+                                epoch=obs.get("epoch"),
+                                epoch_windows=obs.get("epoch_windows"),
+                                epoch_bytes_per_window=_rounded(
+                                    obs.get("epoch_bytes_per_window")),
+                                epoch_dropped=obs.get("epoch_dropped"),
+                                drops_known=obs.get("drops_known"),
                                 horizon_s=_rounded(horizon_s),
                                 horizon_count=obs.get("remaining"),
                                 horizon_unit=obs.get("remaining_unit"),
