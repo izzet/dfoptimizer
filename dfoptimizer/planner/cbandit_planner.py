@@ -606,7 +606,8 @@ class CoordinateBanditPlanner:
         return out
 
     def _pick(self, short: str, current, domain: str, exposed_s: Optional[float] = None,
-              remaining: Optional[float] = None, cost_override: Optional[float] = None):
+              remaining: Optional[float] = None, cost_override: Optional[float] = None,
+              measured_gain_only: bool = False):
         """UCB over the neighbourhood in remaining-run wall seconds.
 
         An unpulled arm gets the best observed wall as an optimistic prior rather than -inf, so a
@@ -645,6 +646,20 @@ class CoordinateBanditPlanner:
             # promising. With the prior above this makes exploration decay as evidence accumulates
             # instead of persisting forever.
             bonus = self._c * scale * math.sqrt(math.log(max(self._total_pulls, 2)) / max(n, 1))
+            # EXPLORATION IS BOUGHT WHERE IT IS CHEAP, AND NEVER WITH A 950 s COPY.
+            #
+            # Orchestrator decision, 2026-09-05, on the evidence of T3-0 4s.9. An untried arm's UCB
+            # bonus is optimism, not a prediction, and for a knob whose first visit costs 0.206 s
+            # that is exactly the right way to pay for information. For a relocation it was buying
+            # 1211 s of notional gain with a 2.90 s per-window bonus over a 417-window horizon, and
+            # that is what cleared a 952 s copy twice on a cell where the copy returned nothing.
+            #
+            # So a relocating candidate is priced on MEASURED gain only: the exposure the move can
+            # relieve, bounded by the destination, computed from the epoch-to-date byte rate. The
+            # bonus is removed from its gain AND from its score, because leaving it in the score
+            # would still let optimism choose the arm it may no longer price.
+            if measured_gain_only:
+                bonus = 0.0
             if lv == current and remaining is not None and self._cost_w != 0.0:
                 # The incumbent is the reference, not an exploration target. Giving it an
                 # optimism bonus subtracts that bonus from every candidate's apparent gain and can
@@ -658,9 +673,18 @@ class CoordinateBanditPlanner:
             if lv != current and cost_override is not None and cost_override > 0.0:
                 cost_s = float(cost_override)
             weighted_cost_s = self._cost_w * cost_s
-            gain_per_window_s = max(cur_mean - (mean - bonus), 0.0)
-            if exposed_s is not None:
-                gain_per_window_s = min(gain_per_window_s, max(float(exposed_s), 0.0))
+            if measured_gain_only and lv != current:
+                # What the move can actually relieve. `exposed_s` is already
+                # min(the domain time this move addresses, the destination bound), both measured,
+                # so it IS the gain rather than a cap on an optimistic one. Once the arm has been
+                # sampled, its own measured improvement is the stricter of the two and wins.
+                relievable = max(float(exposed_s), 0.0) if exposed_s is not None else 0.0
+                measured = max(cur_mean - mean, 0.0)
+                gain_per_window_s = relievable if n == 0 else min(measured, relievable)
+            else:
+                gain_per_window_s = max(cur_mean - (mean - bonus), 0.0)
+                if exposed_s is not None:
+                    gain_per_window_s = min(gain_per_window_s, max(float(exposed_s), 0.0))
             gain_s = (gain_per_window_s * remaining
                       if remaining is not None else None)
             payable = (lv == current or self._cost_w == 0.0 or cost_s <= 0.0
@@ -680,6 +704,8 @@ class CoordinateBanditPlanner:
             detail.append({"level": lv, "n": n, "mean": round(mean, 4),
                            "bonus": round(bonus, 4), "gain_s": _rounded(gain_s),
                            "cost_s": round(cost_s, 4), "payable": payable,
+                           # So a decision can be read back without inferring which rule priced it.
+                           "measured_gain_only": bool(measured_gain_only and lv != current),
                            "score": _rounded(score)})
             if score < best_score:
                 best, best_score = lv, score
@@ -1060,7 +1086,8 @@ class CoordinateBanditPlanner:
                                 bytes_per_window=reloc_bytes)
                         cand_choice, cand_detail = self._pick(
                             cand_short, cand_cur, dom, exposed_s=cand_exposed,
-                            remaining=obs.get("remaining"), cost_override=cand_cost_override)
+                            remaining=obs.get("remaining"), cost_override=cand_cost_override,
+                            measured_gain_only=(cand_short in self._relocating))
                         if cand_choice == cand_cur:
                             may_escalate, esc_state = self._escalation_state(cand_short, cand_cur)
                             tried.append({"knob": cand_short, "verdict": "stay",
