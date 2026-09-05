@@ -413,6 +413,22 @@ class CoordinateBanditPlanner:
         epoch_key = m.get("epoch")
         if epoch_key is None and wpe:
             epoch_key = int(window // float(wpe))
+        # THE FULL WINDOW INPUT, ON EVERY WINDOW INCLUDING A DECLINE.
+        #
+        # T3-0 4s.21: the replay harness could not reproduce the cosmoflow stage because
+        # `optimizer.cbandit.decision` does not carry what this method consumed -- windows_per_epoch,
+        # the busy time, the horizon on a decline -- so a replay had to reconstruct them and got a
+        # different run. This record closes that at the source: it is everything the planner reads,
+        # emitted beside the decision, so a replay is exact by construction rather than by
+        # archaeology. One line per window per node; at unet3d's 4312 windows it is a few MB.
+        logger.info("optimizer.cbandit.window_inputs", window=window,
+                    metrics={k: v for k, v in m.items()},
+                    node_ceiling_gbs=self._node_ceiling_gbs or None,
+                    aggregate_ceiling_gbs=self._agg_ceiling_gbs or None,
+                    nodes=self._nodes or None,
+                    dest_read_gbs=self._dest_read_gbs or None,
+                    stage_rate_gbs=self._stage_rate_gbs or None,
+                    cfg=dict(self._planned_cfg.get(window, self._short_cfg())))
         self._note_epoch(epoch_key, m.get("node_read_bytes", 0.0),
                          self._node_read_bandwidth({
                              "node_read_bytes": m.get("node_read_bytes", 0.0),
