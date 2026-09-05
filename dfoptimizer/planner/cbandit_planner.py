@@ -210,6 +210,27 @@ class CoordinateBanditPlanner:
         # critical path. Measured: the two forms give 0 and 51 payable windows on the same records.
         self._epoch_bw_sum: float = 0.0
         self._epoch_bw_n: int = 0
+        # THE DWELL IS DERIVED FROM THE OBSERVED VARIANCE, not fixed in windows.
+        #
+        # Orchestrator decision, 2026-09-05, on T3-0 4s.17. The acceptance test confirmed
+        # `read_threads=1` 936 times on three-window samples, on a cell where the cost of that value
+        # arrives in one window of six and lasts 10 to 42 s against a 4.37 s median window. One
+        # stall is longer than the whole sample the dwell required, so 936 confirmations were not
+        # 936 observations of anything. A larger fixed count is only another constant; the sample
+        # size the test itself needs is not.
+        #
+        #     n_required = ceil( ((z_alpha + z_power) x sigma_wall / delta)^2 )
+        #     dwell      = max(min_samples, n_required),  capped at the remaining horizon
+        #
+        # sigma_wall is the epoch-to-date standard deviation of the window wall, so it resets with
+        # the regime; delta is `effect_floor` x the epoch's mean wall, the planner's existing
+        # minimum interesting effect expressed in seconds. On a smooth cell (cosmoflow, 1.3 percent
+        # spread) this reduces to min_samples. On a bursty one it grows until the sample could have
+        # contained the bursts. If it exceeds the horizon the value is never characterised and the
+        # planner stays on the incumbent rather than guessing.
+        self._power = float(os.environ.get("DFOPTIMIZER_CBANDIT_POWER", "0.80"))
+        self._epoch_wall_sum: float = 0.0
+        self._epoch_wall_sq: float = 0.0
 
     # --- Planner-compatible registration (identical contract to Planner/CLBOPlanner) ---
     def register_knobs(self, knob_defs, current_values=None):
@@ -390,7 +411,8 @@ class CoordinateBanditPlanner:
                              "node_read_bytes": m.get("node_read_bytes", 0.0),
                              "node_read_bytes_any": m.get("node_read_bytes_any", 0.0),
                              "node_read_busy_s": m.get("node_read_busy_s", 0.0),
-                             "wall": float(wall)}))
+                             "wall": float(wall)}),
+                         wall_s=float(wall))
         return {
             "cfg": dict(self._planned_cfg.get(window, self._short_cfg())),
             "domains": domains,
@@ -480,7 +502,8 @@ class CoordinateBanditPlanner:
         except Exception:                          # noqa: BLE001
             return None
 
-    def _note_epoch(self, obs_epoch, node_read_bytes, node_read_gbs=None) -> None:
+    def _note_epoch(self, obs_epoch, node_read_bytes, node_read_gbs=None,
+                    wall_s=None) -> None:
         """Accumulate this window's bytes into the current epoch, and reset on an epoch change."""
         if obs_epoch != self._epoch_key:
             self._epoch_key = obs_epoch
@@ -488,6 +511,8 @@ class CoordinateBanditPlanner:
             self._epoch_windows = 0
             self._epoch_bw_sum = 0.0
             self._epoch_bw_n = 0
+            self._epoch_wall_sum = 0.0
+            self._epoch_wall_sq = 0.0
             self._epoch_dropped = False
             self._drops_at_epoch_start = self._ring_drops()
         # GB, NOT BYTES. `node_read_bytes` is raw bytes and every priced quantity downstream is in
@@ -499,6 +524,9 @@ class CoordinateBanditPlanner:
         if node_read_gbs:
             self._epoch_bw_sum += float(node_read_gbs)
             self._epoch_bw_n += 1
+        if wall_s:
+            self._epoch_wall_sum += float(wall_s)
+            self._epoch_wall_sq += float(wall_s) ** 2
         self._epoch_windows += 1
         now = self._ring_drops()
         if now is not None:
@@ -510,6 +538,121 @@ class CoordinateBanditPlanner:
                 self._drops_at_epoch_start = now
             elif now > base:
                 self._epoch_dropped = True
+
+    @staticmethod
+    def _z(p: float) -> float:
+        """Standard normal quantile, Acklam's rational approximation (|error| < 1.15e-9).
+
+        Written out rather than imported so the planner keeps no scipy dependency on the online
+        path, and so the two constants it is used with are visible where they are used.
+        """
+        if p <= 0.0 or p >= 1.0:
+            return 0.0
+        a = (-3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02,
+             1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00)
+        b = (-5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02,
+             6.680131188771972e+01, -1.328068155288572e+01)
+        c = (-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00,
+             -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00)
+        d = (7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00,
+             3.754408661907416e+00)
+        pl, ph = 0.02425, 1 - 0.02425
+        if p < pl:
+            q = math.sqrt(-2 * math.log(p))
+            return (((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5]) / \
+                   ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1)
+        if p > ph:
+            q = math.sqrt(-2 * math.log(1 - p))
+            return -(((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5]) / \
+                    ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1)
+        q = p - 0.5
+        r = q * q
+        return (((((a[0]*r+a[1])*r+a[2])*r+a[3])*r+a[4])*r+a[5])*q / \
+               (((((b[0]*r+b[1])*r+b[2])*r+b[3])*r+b[4])*r+1)
+
+    def _epoch_wall_stats(self) -> Optional[Tuple[float, float, int]]:
+        """(mean, sample sigma, n) of the window wall over this epoch so far, or None."""
+        n = self._epoch_windows
+        if n < 2 or self._epoch_wall_sum <= 0.0:
+            return None
+        mean = self._epoch_wall_sum / n
+        var = max((self._epoch_wall_sq - n * mean * mean) / (n - 1), 0.0)
+        return mean, math.sqrt(var), n
+
+    def _within_arm_sigma(self, short: str) -> Optional[Tuple[float, float, int]]:
+        """(mean, pooled WITHIN-arm sigma, total n) over the sampled values of one knob.
+
+        WHY NOT THE EPOCH'S TOTAL WALL SPREAD, which is what the decision as written asked for.
+        A power calculation needs the noise the test must see THROUGH, and the epoch-to-date spread
+        of the wall also contains the differences BETWEEN the values the controller visited -- which
+        is the signal, not the noise. Using the total makes the dwell grow exactly because the
+        controller is doing its job: measured on the D1 regression cell, sigma 1.288 on a 13.44 s
+        mean gives n_required = 181 and freezes the descent that test exists to check.
+
+        Pooling the within-arm variances is the same quantity Welch is estimating, so the dwell it
+        implies is the sample size that test actually needs. Falls back to the epoch-wide spread
+        when no arm of this knob has two samples yet, which is the only case where there is nothing
+        better to use.
+        """
+        vs = [list(v) for (k, _lv), v in self._samples.items() if k == short and len(v) >= 2]
+        if not vs:
+            return None
+        num = den = 0.0
+        tot = 0
+        allv = []
+        for v in vs:
+            n = len(v)
+            m = sum(v) / n
+            num += sum((x - m) ** 2 for x in v)
+            den += n - 1
+            tot += n
+            allv += v
+        if den <= 0:
+            return None
+        return sum(allv) / len(allv), math.sqrt(num / den), tot
+
+    def required_dwell(self, remaining: Optional[float] = None,
+                       short: Optional[str] = None) -> Tuple[int, dict]:
+        """How many windows a value must be held to be worth testing, from the observed variance.
+
+        Returns (dwell, why) where `why` carries the terms so a decision can be read back. The
+        dwell is `max(min_samples, n_required)` capped at the remaining horizon; `why["reachable"]`
+        is False when the required sample exceeds the horizon, and the caller must then leave the
+        value uncharacterised rather than declare it exhausted.
+
+        On cosmoflow's dwell cell the steady-state spread is 1.3 percent of the wall, so
+        `n_required` is 1 and this reduces to `min_samples` -- the behaviour 4p measured, unchanged.
+        On unet3d dev2 the wall carries 10 to 42 s stalls on a 4.37 s median window, so it grows,
+        which is the whole point: `neighbourhood_exhausted_no_help` may not be declared from a
+        sample that could not have contained the cost (4s.17).
+        """
+        st = self._within_arm_sigma(short) if short else None
+        src = "within_arm"
+        if st is None:
+            st = self._epoch_wall_stats()
+            src = "epoch_wall"
+        why = {"floor": self._min_samples, "alpha": self._alpha, "power": self._power,
+               "effect_floor": self._effect_floor, "sigma_from": src}
+        if st is None:
+            why.update(reason="no_wall_variance_yet", reachable=True)
+            return self._min_samples, why
+        mean, sigma, n = st
+        delta = self._effect_floor * mean
+        why.update(sigma_wall=round(sigma, 5), mean_wall=round(mean, 5),
+                   delta=round(delta, 5), n_observed=n)
+        if delta <= 0.0:
+            why.update(reason="no_effect_size", reachable=True)
+            return self._min_samples, why
+        z = self._z(1.0 - self._alpha / 2.0) + self._z(self._power)
+        n_req = int(math.ceil((z * sigma / delta) ** 2))
+        why["n_required"] = n_req
+        dwell = max(self._min_samples, n_req)
+        if remaining is not None and remaining > 0 and dwell > remaining:
+            why.update(reason="exceeds_horizon", reachable=False,
+                       horizon=int(remaining))
+            return int(remaining), why
+        why.update(reason="derived", reachable=True)
+        return dwell, why
 
     def _epoch_src_gbs(self) -> Optional[float]:
         """The node's observed read rate over this epoch so far, GB/s, or None if unusable.
@@ -919,13 +1062,22 @@ class CoordinateBanditPlanner:
         alts = [lv for lv in self._neighbourhood(short, current) if lv != current]
         if not alts:
             return True, "neighbourhood_exhausted"
+        # THE SAMPLE MUST BE ABLE TO CONTAIN THE COST, not merely reach min_samples.
+        #
+        # 4s.17: `read_threads=1` was confirmed 936 times with `neighbourhood_exhausted_no_help` on
+        # three-window samples, on a cell where the cost of that value appears in one window in six
+        # and lasts longer than the sample. `exhausted` is a strong claim and it may not be made
+        # from evidence that is under-powered for the effect the test is looking for.
+        need, _why = self.required_dwell(short=short)
         base = list(self._samples.get((short, current), ()))
-        if len(base) < self._min_samples:
-            return False, "incumbent_under_sampled"
+        if len(base) < need:
+            return False, ("incumbent_under_sampled" if len(base) < self._min_samples
+                           else "incumbent_under_powered:%d<%d" % (len(base), need))
         for lv in alts:
             cand = list(self._samples.get((short, lv), ()))
-            if len(cand) < self._min_samples:
-                return False, f"untried_neighbour:{lv}"
+            if len(cand) < need:
+                return False, (f"untried_neighbour:{lv}" if len(cand) < self._min_samples
+                               else "neighbour_under_powered:%s:%d<%d" % (lv, len(cand), need))
             verdict = accept_decision(base, cand,
                                       alpha=self._alpha, effect_floor=self._effect_floor)
             if verdict == "accept":
@@ -1107,6 +1259,7 @@ class CoordinateBanditPlanner:
                     # The relocation's predicted per-window gain, kept across the candidate loop so
                     # the decision record carries the prediction the run was made on (dev3).
                     reloc_gain_last = None
+                    dwell_last = None
                     for cand_short in order:
                         cand_cur = cfg_now[cand_short]
                         # THE EXPOSURE A STORAGE ACTUATOR CAN RELIEVE, in a storage-suspect
@@ -1199,8 +1352,11 @@ class CoordinateBanditPlanner:
                         # comparison. Caught by C8, whose ungated arm stopped being able to thrash.
                         if accepted and self._accept_enabled and self._min_dwell > 0:
                             held = completed - self._last_move_window.get(cand_short, -10**9)
-                            if held < self._min_dwell:
-                                accepted, cand_why = False, "dwell:%d<%d" % (held, self._min_dwell)
+                            need, dwell_why = self.required_dwell(obs.get("remaining"),
+                                                                 short=cand_short)
+                            if held < need:
+                                accepted, cand_why = False, "dwell:%d<%d" % (held, need)
+                                dwell_last = dwell_why
                         may_escalate, esc_state = self._escalation_state(cand_short, cand_cur)
                         tried.append({"knob": cand_short, "verdict": cand_why,
                                       "to": cand_choice,
@@ -1241,6 +1397,8 @@ class CoordinateBanditPlanner:
                                 epoch_src_gbs=_rounded(obs.get("epoch_src_gbs")),
                                 dest_read_gbs=self._dest_read_gbs or None,
                                 reloc_gain_per_window=_rounded(reloc_gain_last),
+                                # The derived dwell's own terms, so a hold can be read back.
+                                dwell=dwell_last,
                                 epoch_bytes_per_window=_rounded(
                                     obs.get("epoch_bytes_per_window")),
                                 epoch_dropped=obs.get("epoch_dropped"),
