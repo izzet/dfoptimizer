@@ -230,10 +230,13 @@ class CoordinateBanditPlanner:
         # contained the bursts. If it exceeds the horizon the value is never characterised and the
         # planner stays on the incumbent rather than guessing.
         self._power = float(os.environ.get("DFOPTIMIZER_CBANDIT_POWER", "0.80"))
-        # The predicted-effect admission (4s.23). DEFAULT OFF until step 2 of its own brief passes:
-        # it still admits one move per node on unet3d where none was expected.
+        # The predicted-effect admission (4s.23, 4s.24). ON by default: with the domain delta taken
+        # as the lower confidence bound of the median, and a missing horizon treated as no horizon,
+        # all three expectations hold -- unet3d admits 0 moves at every alpha and power, cosmoflow's
+        # relocation needs 5 to 8 windows of a 70-window horizon, and D1 still descends to the
+        # optimum in 35 windows with 8 plans. Set to 0 for the ablation.
         self._predicted_effect_gate = os.environ.get(
-            "DFOPTIMIZER_CBANDIT_PREDICTED_EFFECT", "0") == "1"
+            "DFOPTIMIZER_CBANDIT_PREDICTED_EFFECT", "1") == "1"
         # Exploration needs a characterised incumbent (4s.20). Implemented, tested, DEFAULT OFF:
         # it blocks cosmoflow's staging as well as unet3d's move, which is not what was asked for.
         # The derived dwell applied to the ESCALATION verdict, which decides whether a costlier
@@ -687,20 +690,58 @@ class CoordinateBanditPlanner:
             self._move_from.pop(short, None)
         return None
 
+    @staticmethod
+    def _median_lower_bound(values, alpha: float) -> Optional[float]:
+        """Distribution-free lower confidence bound of the median, from the order statistics.
+
+        Orchestrator decision, 2026-09-05 (T3-0 4s.24). The domain delta is an ESTIMATE and carries
+        its own uncertainty, so the planner uses the bound rather than the point estimate. 4s.23's
+        eight spurious moves came from a median resting on `min_samples` windows; the remedies on
+        offer were a window count, which is a constant, and the previous epoch, which does not exist
+        in epoch 0. This is neither: it is the same alpha the acceptance test already documents.
+
+        The k-th smallest observation is a lower bound for the median with confidence
+        `P(Bin(n, 0.5) >= k)`, so the bound is the largest k whose tail is still at least
+        `1 - alpha`. With few samples no k qualifies and the bound is the sample MINIMUM, which is
+        the behaviour that matters: an early epoch of a few small windows cannot admit a move on a
+        median it has not earned. As n grows the qualifying k rises and the bound climbs toward the
+        median.
+
+        n=3 at alpha=0.05 gives the minimum (P(Bin<=0) = 0.125 > 0.05); n=10 gives the second
+        smallest; n=30 the tenth. No distributional assumption is made anywhere.
+        """
+        xs = sorted(v for v in values if v is not None)
+        n = len(xs)
+        if n == 0:
+            return None
+        if n == 1:
+            return xs[0]
+        best = 1
+        cum = 0.0
+        denom = float(2 ** n)
+        for k in range(1, n + 1):
+            cum += math.comb(n, k - 1) / denom
+            if cum <= alpha:
+                best = k
+            else:
+                break
+        return xs[best - 1]
+
     def _epoch_domain_exposed(self, dom: str) -> Optional[float]:
         """Mean exposed time of one domain per window, over this epoch so far.
 
-        The most any move of a knob that owns `dom` can recover. A BOUND, measured, not a model of
-        what the move would actually do -- which is why it is only ever used to ask whether an
-        effect of that size could be verified in the run that is left.
+        The most any move of a knob that owns `dom` can recover, taken as the LOWER CONFIDENCE
+        BOUND of the epoch-to-date median rather than the median itself (4s.24). A bound on a bound:
+        measured, not a model of what the move would do, and used only to ask whether an effect of
+        that size could be verified in the run that is left.
         """
         if self._epoch_windows < self._min_samples:
             return None
         vals = [v for v in (self._epoch_dom.get(dom) or ()) if v is not None]
         if not vals:
             return None
-        med = statistics.median(vals)
-        return med if med > 0.0 else None
+        lb = self._median_lower_bound(vals, self._alpha)
+        return lb if lb and lb > 0.0 else None
 
     def predicted_effect(self, short: str, dom: str,
                          reloc_gain: Optional[float] = None) -> Tuple[Optional[float], str]:
@@ -1509,16 +1550,22 @@ class CoordinateBanditPlanner:
                         need_v, vwhy = ((self.required_dwell(rem_w, short=cand_short,
                                                             value=cand_cur, delta=delta))
                                         if delta is not None else (0, {}))
-                        verifiable = bool(vwhy.get("reachable", True))
+                        # NO HORIZON IS NOT AN UNBOUNDED ONE. "Admitted when n_required fits the
+                        # windows remaining" cannot be satisfied when there are no windows
+                        # remaining to compare against, and treating a missing horizon as passing
+                        # is how all eight of 4s.23's spurious moves got in: every one of them was
+                        # at window 530 of 539, where the record carries no horizon at all. Same
+                        # discipline as the price, which declines a positive-cost move without one.
+                        verifiable = bool(vwhy.get("reachable", True)) and bool(rem_w)
                         delta_last = {"delta": _rounded(delta), "source": delta_src,
                                       "n_required": vwhy.get("n_required"),
                                       "verifiable": verifiable}
                         if not verifiable:
                             tried.append({"knob": cand_short,
                                           "verdict": "unverifiable_in_horizon",
-                                          "escalation": "n_required=%s>horizon=%s"
+                                          "escalation": "n_required=%s horizon=%s"
                                                         % (vwhy.get("n_required"),
-                                                           vwhy.get("horizon"))})
+                                                           vwhy.get("horizon") or rem_w)})
                             if short is None:
                                 short, cur, choice, detail, why = (
                                     cand_short, cand_cur, cand_cur, [], "unverifiable_in_horizon")
