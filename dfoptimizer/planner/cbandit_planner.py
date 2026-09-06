@@ -56,6 +56,7 @@ outside the objective is consulted. It is a search policy.
 from __future__ import annotations
 
 import math
+import statistics
 import os
 import uuid
 from collections import deque
@@ -229,15 +230,30 @@ class CoordinateBanditPlanner:
         # contained the bursts. If it exceeds the horizon the value is never characterised and the
         # planner stays on the incumbent rather than guessing.
         self._power = float(os.environ.get("DFOPTIMIZER_CBANDIT_POWER", "0.80"))
+        # The predicted-effect admission (4s.23). DEFAULT OFF until step 2 of its own brief passes:
+        # it still admits one move per node on unet3d where none was expected.
+        self._predicted_effect_gate = os.environ.get(
+            "DFOPTIMIZER_CBANDIT_PREDICTED_EFFECT", "0") == "1"
         # Exploration needs a characterised incumbent (4s.20). Implemented, tested, DEFAULT OFF:
         # it blocks cosmoflow's staging as well as unet3d's move, which is not what was asked for.
-        self._explore_gate = os.environ.get("DFOPTIMIZER_CBANDIT_EXPLORE_GATE", "0") == "1"
         # The derived dwell applied to the ESCALATION verdict, which decides whether a costlier
         # actuator may be reached. Default off for the reason in _escalation_state.
         self._power_escalation = os.environ.get(
             "DFOPTIMIZER_CBANDIT_POWER_ESCALATION", "0") == "1"
         self._epoch_wall_sum: float = 0.0
         self._epoch_wall_sq: float = 0.0
+        # Epoch-to-date exposed time per domain. A knob that OWNS a domain can recover at most that
+        # domain's exposed time, so this is the measured BOUND on its effect (4s.23). Epoch-scale
+        # for the same reason the bytes are: one window is not a regime.
+        # Per-domain exposed time, kept as VALUES rather than a running sum because the statistic
+        # is the MEDIAN. On unet3d the input domain is 1.9 ms in a typical window and 1.10 s on
+        # average, because 16 percent of windows carry a 10 to 42 s stall (4s.19). The mean says a
+        # parallelism move could recover a second per window, which is true of no window the move
+        # would act in; the median says what a typical window holds. The decision's own expected
+        # value for this cell is the median, and the two give opposite admissions (4s.23).
+        self._epoch_dom: Dict[str, Deque[float]] = {}
+        # What a move predicted, so it can be reverted if it is not confirmed at that size.
+        self._move_from: Dict[str, tuple] = {}
 
     # --- Planner-compatible registration (identical contract to Planner/CLBOPlanner) ---
     def register_knobs(self, knob_defs, current_values=None):
@@ -429,6 +445,9 @@ class CoordinateBanditPlanner:
                     dest_read_gbs=self._dest_read_gbs or None,
                     stage_rate_gbs=self._stage_rate_gbs or None,
                     cfg=dict(self._planned_cfg.get(window, self._short_cfg())))
+        for _d, _v in domains.items():
+            self._epoch_dom.setdefault(_d, deque(maxlen=self._sample_window)).append(
+                float(_v or 0.0))
         self._note_epoch(epoch_key, m.get("node_read_bytes", 0.0),
                          self._node_read_bandwidth({
                              "node_read_bytes": m.get("node_read_bytes", 0.0),
@@ -536,6 +555,7 @@ class CoordinateBanditPlanner:
             self._epoch_bw_n = 0
             self._epoch_wall_sum = 0.0
             self._epoch_wall_sq = 0.0
+            self._epoch_dom = {}
             self._epoch_dropped = False
             self._drops_at_epoch_start = self._ring_drops()
         # GB, NOT BYTES. `node_read_bytes` is raw bytes and every priced quantity downstream is in
@@ -641,8 +661,78 @@ class CoordinateBanditPlanner:
             return None
         return sum(allv) / len(allv), math.sqrt(num / den), tot
 
+    def _unconfirmed_move(self, window: int,
+                          remaining: Optional[float]) -> Optional[Tuple[str, object]]:
+        """A knob whose last move has its predicted sample and did not confirm. Returns (knob, old).
+
+        Only ever fires for a move this planner made and recorded a prediction for, only once the
+        moved value has `n_required(delta)` observations, and only when `accept_decision` refuses.
+        Returns None otherwise, which is the common case.
+        """
+        for short, (old_value, delta, _w) in list(self._move_from.items()):
+            if not delta or delta <= 0:
+                continue
+            cur = self._short_cfg().get(short)
+            if cur == old_value:
+                self._move_from.pop(short, None)
+                continue
+            cand = list(self._samples.get((short, cur), ()))
+            base = list(self._samples.get((short, old_value), ()))
+            need, _ = self.required_dwell(remaining, short=short, value=old_value, delta=delta)
+            if len(cand) < need or len(base) < self._min_samples:
+                continue
+            if accept_decision(base, cand, alpha=self._alpha,
+                               effect_floor=self._effect_floor) != "accept":
+                return short, old_value
+            self._move_from.pop(short, None)
+        return None
+
+    def _epoch_domain_exposed(self, dom: str) -> Optional[float]:
+        """Mean exposed time of one domain per window, over this epoch so far.
+
+        The most any move of a knob that owns `dom` can recover. A BOUND, measured, not a model of
+        what the move would actually do -- which is why it is only ever used to ask whether an
+        effect of that size could be verified in the run that is left.
+        """
+        if self._epoch_windows < self._min_samples:
+            return None
+        vals = [v for v in (self._epoch_dom.get(dom) or ()) if v is not None]
+        if not vals:
+            return None
+        med = statistics.median(vals)
+        return med if med > 0.0 else None
+
+    def predicted_effect(self, short: str, dom: str,
+                         reloc_gain: Optional[float] = None) -> Tuple[Optional[float], str]:
+        """The candidate's predicted per-window effect, and where it came from.
+
+        Project owner decision, 2026-09-05 (T3-0 4s.23). The planner acts only on moves whose effect
+        it can predict, verify within the horizon and afford. That replaces the 2 percent
+        `effect_floor`, which 4s.20 measured as being far below the window-to-window noise of BOTH
+        cells -- so no affordable sample could ever resolve it, and the floor was not a minimum
+        interesting effect but a number nothing could clear.
+
+          relocation      the physical price's gain per window (4s.14), already measured
+          domain owner    the epoch-to-date exposed time of the domain it owns, a measured bound
+          neither         no delta, and the candidate is not admitted
+
+        No preferred direction: both neighbours of a knob get the same delta and the acceptance test
+        decides between them.
+        """
+        if short in self._relocating:
+            return (reloc_gain, "relocation_gain") if reloc_gain and reloc_gain > 0 else (
+                None, "relocation_not_payable")
+        own = self._domain.get(short)
+        if not own:
+            return None, "no_domain"
+        ex = self._epoch_domain_exposed(own)
+        if ex is None or ex <= 0.0:
+            return None, "no_exposed_time"
+        return ex, "domain_exposed:%s" % own
+
     def required_dwell(self, remaining: Optional[float] = None,
-                       short: Optional[str] = None, value=None) -> Tuple[int, dict]:
+                       short: Optional[str] = None, value=None,
+                       delta: Optional[float] = None) -> Tuple[int, dict]:
         """How many windows a value must be held to be worth testing, from the observed variance.
 
         Returns (dwell, why) where `why` carries the terms so a decision can be read back. The
@@ -667,7 +757,11 @@ class CoordinateBanditPlanner:
             why.update(reason="no_wall_variance_yet", reachable=True)
             return self._min_samples, why
         mean, sigma, n = st
-        delta = self._effect_floor * mean
+        # `delta` is the CANDIDATE'S PREDICTED EFFECT when the caller has one (4s.23). The
+        # effect_floor fraction remains only for callers that do not, which after this change is
+        # the escalation's opt-in power check.
+        if delta is None:
+            delta = self._effect_floor * mean
         why.update(sigma_wall=round(sigma, 5), mean_wall=round(mean, 5),
                    delta=round(delta, 5), n_observed=n)
         if delta <= 0.0:
@@ -1180,20 +1274,15 @@ class CoordinateBanditPlanner:
         # against 74 windows and its window-2 stage is blocked too. The 1.3 percent figure the
         # decision relied on is the steady-state spread ACROSS REPS, not the window-to-window
         # spread the power calculation needs. Enable with DFOPTIMIZER_CBANDIT_EXPLORE_GATE=1.
-        if self._explore_gate:
-            need, _why = self.required_dwell(short=short, value=current)
-            if len(base) < need:
-                return False, ("incumbent_under_sampled" if len(base) < self._min_samples
-                               else "incumbent_under_powered:%d<%d" % (len(base), need))
-            if len(cand) < self._min_samples:
-                return True, "explore_under_sampled"
-        else:
-            # GATE OFF is the deployed default and must reproduce the previous order exactly:
-            # an under-sampled CANDIDATE is explored before anything is asked about the incumbent.
-            if len(cand) < self._min_samples:
-                return True, "explore_under_sampled"
-            if len(base) < self._min_samples:
-                return False, "incumbent_under_sampled"
+        # THE EXPLORE GATE IS RETIRED (4s.23). It asked whether the incumbent was characterised
+        # against a 2 percent floor, which no cell could clear, so it blocked the cosmoflow stage as
+        # well as unet3d's move. Admission is now decided upstream by the predicted effect and
+        # whether it can be verified in the horizon, which is the same question asked with a number
+        # that means something.
+        if len(cand) < self._min_samples:
+            return True, "explore_under_sampled"
+        if len(base) < self._min_samples:
+            return False, "incumbent_under_sampled"
 
         verdict = accept_decision(base, cand,
                                   alpha=self._alpha, effect_floor=self._effect_floor)
@@ -1320,6 +1409,26 @@ class CoordinateBanditPlanner:
                     else:
                         order = self._escalation_order(owned)
                         promoted = set()
+                    # VERIFY AT THE PREDICTED SIZE, OR REVERT.
+                    #
+                    # "Admitted because the effect is verifiable in the horizon" is only meaningful
+                    # if the verification actually happens. Once the moved value has the sample its
+                    # own prediction required, the acceptance test is run against the value it came
+                    # from; if it does not accept, the move goes back. A move that was worth making
+                    # on a prediction is not worth keeping without one.
+                    revert = self._unconfirmed_move(completed, obs.get("remaining"))
+                    if revert is not None:
+                        rshort, rback = revert
+                        nxt = dict(self._short_cfg())
+                        nxt[rshort] = rback
+                        self._planned_cfg[w + 1] = dict(nxt)
+                        self._last_move_window[rshort] = completed
+                        self._move_from.pop(rshort, None)
+                        logger.info("optimizer.cbandit.reverted", window=completed, knob=rshort,
+                                    back_to=rback,
+                                    reason="not confirmed at its predicted effect")
+                        return self._plans_for(nxt, finding, "input")
+
                     cfg_now = self._short_cfg()
                     short, cur, choice, detail, why = None, None, None, [], "no_change"
                     tried = []
@@ -1327,6 +1436,7 @@ class CoordinateBanditPlanner:
                     # the decision record carries the prediction the run was made on (dev3).
                     reloc_gain_last = None
                     dwell_last = None
+                    delta_last = None
                     for cand_short in order:
                         cand_cur = cfg_now[cand_short]
                         # THE EXPOSURE A STORAGE ACTUATOR CAN RELIEVE, in a storage-suspect
@@ -1377,9 +1487,45 @@ class CoordinateBanditPlanner:
                             cand_cost_override = self._relocation_cost_s(
                                 cand_short, None, obs, None,
                                 bytes_per_window=reloc_bytes)
+                        # THE PREDICTED EFFECT, AND WHETHER IT CAN BE VERIFIED IN THE RUN LEFT.
+                        #
+                        # NOT when the acceptance gate is disabled. DFOPTIMIZER_CBANDIT_ACCEPT=0 is
+                        # the no-gate ablation and must recover the previous behaviour exactly, the
+                        # same reason the dwell is skipped there. Caught by C8, whose ungated arm
+                        # stopped thrashing on one seed and so stopped being a control.
+                        delta, delta_src = (self.predicted_effect(
+                            cand_short, dom, reloc_gain=reloc_gain_last)
+                            if (self._accept_enabled and self._predicted_effect_gate)
+                            else (None, "gate_disabled"))
+                        rem_w = obs.get("remaining")
+                        if delta is None and self._accept_enabled \
+                                and self._predicted_effect_gate:
+                            tried.append({"knob": cand_short, "verdict": "no_predicted_effect",
+                                          "escalation": delta_src})
+                            if short is None:
+                                short, cur, choice, detail, why = (
+                                    cand_short, cand_cur, cand_cur, [], "no_predicted_effect")
+                            continue
+                        need_v, vwhy = ((self.required_dwell(rem_w, short=cand_short,
+                                                            value=cand_cur, delta=delta))
+                                        if delta is not None else (0, {}))
+                        verifiable = bool(vwhy.get("reachable", True))
+                        delta_last = {"delta": _rounded(delta), "source": delta_src,
+                                      "n_required": vwhy.get("n_required"),
+                                      "verifiable": verifiable}
+                        if not verifiable:
+                            tried.append({"knob": cand_short,
+                                          "verdict": "unverifiable_in_horizon",
+                                          "escalation": "n_required=%s>horizon=%s"
+                                                        % (vwhy.get("n_required"),
+                                                           vwhy.get("horizon"))})
+                            if short is None:
+                                short, cur, choice, detail, why = (
+                                    cand_short, cand_cur, cand_cur, [], "unverifiable_in_horizon")
+                            continue
                         cand_choice, cand_detail = self._pick(
                             cand_short, cand_cur, dom, exposed_s=cand_exposed,
-                            remaining=obs.get("remaining"), cost_override=cand_cost_override,
+                            remaining=rem_w, cost_override=cand_cost_override,
                             measured_gain_only=(cand_short in self._relocating))
                         if cand_choice == cand_cur:
                             may_escalate, esc_state = self._escalation_state(cand_short, cand_cur)
@@ -1419,8 +1565,9 @@ class CoordinateBanditPlanner:
                         # comparison. Caught by C8, whose ungated arm stopped being able to thrash.
                         if accepted and self._accept_enabled and self._min_dwell > 0:
                             held = completed - self._last_move_window.get(cand_short, -10**9)
-                            need, dwell_why = self.required_dwell(obs.get("remaining"),
-                                                                 short=cand_short)
+                            need, dwell_why = self.required_dwell(
+                                obs.get("remaining"), short=cand_short, value=cand_cur,
+                                delta=delta)
                             if held < need:
                                 accepted, cand_why = False, "dwell:%d<%d" % (held, need)
                                 dwell_last = dwell_why
@@ -1466,6 +1613,7 @@ class CoordinateBanditPlanner:
                                 reloc_gain_per_window=_rounded(reloc_gain_last),
                                 # The derived dwell's own terms, so a hold can be read back.
                                 dwell=dwell_last,
+                                predicted_effect=delta_last,
                                 epoch_bytes_per_window=_rounded(
                                     obs.get("epoch_bytes_per_window")),
                                 epoch_dropped=obs.get("epoch_dropped"),
@@ -1487,6 +1635,10 @@ class CoordinateBanditPlanner:
                                 wall=round(obs["wall"], 4), candidates=detail)
                     if choice != cur:
                         self._last_move_window[short] = completed
+                        # What this move predicted, so it can be checked at that size later.
+                        if choice != cur:
+                            self._move_from[short] = (cur, (delta_last or {}).get("delta"),
+                                                      completed)
                     nxt = dict(cfg_now)
                     nxt[short] = choice
                     self._planned_cfg[w + 1] = dict(nxt)
