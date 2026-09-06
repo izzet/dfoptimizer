@@ -262,6 +262,10 @@ class CoordinateBanditPlanner:
         # neither. Set when an ack arrives with reason `relocated`; cleared when the arm moves again.
         self._reloc_live_from: Dict[str, int] = {}
         self._reloc_pending: Dict[str, object] = {}
+        # The relocation value already published and not yet resolved by an ack. A second plan for
+        # the SAME value is the repeat that cost five copies a node (4s.32); a plan for a different
+        # value is a real decision and is not suppressed.
+        self._reloc_published: Dict[str, object] = {}
 
     # --- Planner-compatible registration (identical contract to Planner/CLBOPlanner) ---
     def register_knobs(self, knob_defs, current_values=None):
@@ -340,6 +344,7 @@ class CoordinateBanditPlanner:
                         note="actuator reported no relocation; incumbent unchanged")
             self._move_from.pop(short_id, None)
             self._reloc_pending.pop(short_id, None)
+            self._reloc_published.pop(short_id, None)
             return
         if short_id in self._relocating and status == "applied" and reason == "relocated":
             # Sampling of the new arm starts HERE, at the window the copy finished in, not at the
@@ -347,6 +352,7 @@ class CoordinateBanditPlanner:
             live = window_index if window_index is not None and window_index >= 0 else self._cur_window
             self._reloc_live_from[short_id] = int(live)
             self._reloc_pending.pop(short_id, None)
+            self._reloc_published.pop(short_id, None)
             logger.info("optimizer.cbandit.reloc_completed", knob_id=knob_id,
                         live_from_window=int(live), completed_at=completed_at)
         if status == "applied":
@@ -1836,7 +1842,22 @@ class CoordinateBanditPlanner:
             old_v = self.current_values[kid]
             if new_v is None or new_v == old_v:
                 continue
+            # NEVER RE-PUBLISH A RELOCATION THAT IS ALREADY IN FLIGHT OR DONE (T3-0 4s.32).
+            #
+            # `current_values` only advances when an ack comes back, so an actuator that applies a
+            # relocation and fails to ack leaves the planner believing nothing happened, and it
+            # re-publishes -- which on a relocation means paying the copy again. `cf_fz_loop_n32_r1c`
+            # paid it five times per node. The actuator is now idempotent, and this is the other
+            # half: once a relocation has been planned, no second plan for the same value is issued
+            # until its ack resolves it one way or the other.
+            if (short in self._relocating
+                    and self._reloc_published.get(short) == new_v):
+                logger.info("optimizer.cbandit.plan_suppressed", knob_id=kid, value=new_v,
+                            reason="this relocation is already published and awaiting its ack")
+                continue
             new_v = kd.clamp(new_v)
+            if short in self._relocating:
+                self._reloc_published[short] = new_v
             if new_v == old_v:
                 continue
             self.current_values[kid] = new_v
