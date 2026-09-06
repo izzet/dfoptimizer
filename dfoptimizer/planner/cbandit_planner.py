@@ -1071,10 +1071,31 @@ class CoordinateBanditPlanner:
             # Multiplying the predicted wall by the observed remaining count puts it in the same
             # units as cost_for(): wall seconds over the rest of this run. With no horizon, only a
             # zero-cost move has a defensible score.
+            #
+            # THE PREDICTED GAIN MUST ENTER THE SCORE, NOT ONLY `payable` (T3-0 4s.28).
+            #
+            # For an untried arm `mean` is the incumbent's own mean, so without a term for what the
+            # move is predicted to ACHIEVE its score is the incumbent's score plus the move's cost:
+            # strictly worse, always, whatever the gain. The UCB bonus used to supply that term by
+            # accident, and removing it for relocations (0eefc37, "measured gain only") removed the
+            # only thing that ever let a relocation win the acquisition.
+            #
+            # Measured on the first frozen cosmoflow loop rep: every one of 32 agents had a
+            # verifiable relocation gain of about 16.7 s per window from window 2, `payable: true`
+            # with gain 1225 s against a 453 s cost, and `_pick` returned `pfs` on all 1,888 of
+            # them because local scored 2157.3 against pfs's 1704.3. Zero plans were published and
+            # the cell did not stage.
+            #
+            # So a candidate priced on measured gain is scored on the wall it is predicted to
+            # produce: the incumbent's mean less that gain, floored at zero. This is the same
+            # quantity `payable` already uses, applied to the ranking as well as the admission.
+            predicted_mean = mean - bonus
+            if measured_gain_only and lv != current:
+                predicted_mean = max(cur_mean - gain_per_window_s, 0.0)
             if remaining is not None:
-                score = (mean - bonus) * remaining + weighted_cost_s
+                score = predicted_mean * remaining + weighted_cost_s
             elif weighted_cost_s <= 0.0:
-                score = mean - bonus
+                score = predicted_mean
             else:
                 score = float("inf")
             if not payable:
@@ -1084,6 +1105,7 @@ class CoordinateBanditPlanner:
                            "cost_s": round(cost_s, 4), "payable": payable,
                            # So a decision can be read back without inferring which rule priced it.
                            "measured_gain_only": bool(measured_gain_only and lv != current),
+                           "predicted_mean": round(predicted_mean, 4),
                            "score": _rounded(score)})
             if score < best_score:
                 best, best_score = lv, score
