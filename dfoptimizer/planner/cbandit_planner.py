@@ -56,6 +56,7 @@ outside the objective is consulted. It is a search policy.
 from __future__ import annotations
 
 import math
+import time as _time
 import statistics
 import os
 import uuid
@@ -261,6 +262,10 @@ class CoordinateBanditPlanner:
         # The copy's own windows are neither the old regime nor the new one, so they are credited to
         # neither. Set when an ack arrives with reason `relocated`; cleared when the arm moves again.
         self._reloc_live_from: Dict[str, int] = {}
+        # The actuator's own completion instant per relocating knob, and the wall-clock time each
+        # window finished. Together they say which windows contain the copy (4s.35).
+        self._reloc_live_at: Dict[str, Optional[float]] = {}
+        self._window_finished_at: Dict[int, float] = {}
         self._reloc_pending: Dict[str, object] = {}
         # The relocation value already published and not yet resolved by an ack. A second plan for
         # the SAME value is the repeat that cost five copies a node (4s.32); a plan for a different
@@ -349,6 +354,20 @@ class CoordinateBanditPlanner:
         if short_id in self._relocating and status == "applied" and reason == "relocated":
             # Sampling of the new arm starts HERE, at the window the copy finished in, not at the
             # window the plan was issued in.
+            # USE THE TIMESTAMP THE ACTUATOR SENT, NOT A WINDOW INDEX (T3-0 4s.35).
+            #
+            # `ActionAck` carries no window index at all, so this fell through to `_cur_window` --
+            # the window the planner happened to be on when the ack was PROCESSED, which on
+            # `cf_fz_loop_n32_r1e` was window 4 while the copy ran for 503 s and finished around
+            # window 22. The arm then recorded the whole staging epoch, `local` looked worse than
+            # the `pfs` mean it left, and all 32 nodes reverted. The replay hid it, because the
+            # replay synthesises the ack with a scaffold offset that happens to be right.
+            #
+            # `completed_at` is the moment the copy returned, so the arm starts at the first window
+            # that FINISHES after it. Windows before that contain the copy and belong to neither
+            # regime.
+            self._reloc_live_at[short_id] = (float(completed_at)
+                                             if completed_at is not None else None)
             live = window_index if window_index is not None and window_index >= 0 else self._cur_window
             self._reloc_live_from[short_id] = int(live)
             self._reloc_pending.pop(short_id, None)
@@ -457,6 +476,8 @@ class CoordinateBanditPlanner:
         # a threshold -- no constant says how much unexplained time is "too much".
         unattributed = max(float(wall) - sum(domains.values()), 0.0)
         remaining, remaining_unit = self._remaining_run(m)
+        # When this window finished, so a completion timestamp can be turned into a window.
+        self._window_finished_at[window] = _time.time()
         # WHICH EPOCH THIS WINDOW BELONGS TO. Preferred from the analyzer's own stamp; derived from
         # the cadence when it is absent, which it is on some presets. Either way the accumulator
         # only needs a key that changes when the epoch does.
@@ -550,10 +571,17 @@ class CoordinateBanditPlanner:
             # to the new level is what made `local` look 32.4 s when the regime it bought runs at
             # 5.5, and reverted it nine windows before its evidence existed.
             if short in self._relocating:
+                live_at = self._reloc_live_at.get(short)
                 live_from = self._reloc_live_from.get(short)
-                if live_from is None and short in self._reloc_pending:
+                if live_from is None and live_at is None and short in self._reloc_pending:
                     continue                      # relocation acked, completion not yet seen
-                if live_from is not None and self._cur_window < live_from:
+                if live_at is not None:
+                    # The timestamp wins: a window that finished before the copy did contains the
+                    # copy, whatever window index the ack arrived on.
+                    fin = self._window_finished_at.get(self._cur_window)
+                    if fin is not None and fin < live_at:
+                        continue
+                elif live_from is not None and self._cur_window < live_from:
                     continue
             n, mean = self._stats.get((short, level), (0, 0.0))
             self._stats[(short, level)] = (n + 1, mean + (wall - mean) / (n + 1))
