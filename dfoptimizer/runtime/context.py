@@ -209,13 +209,16 @@ class OptimizerContext:
             return self.desired_actions_for(func_name, at)
         return self.drain_actions_for(func_name, at)
 
-    def ack_action(self, plan: ActionPlan, old_value, new_value, status="applied"):
+    def ack_action(self, plan: ActionPlan, old_value, new_value, status="applied",
+                   reason="", completed_at=None):
         ack = ActionAck(
             plan_id=plan.plan_id,
             knob_id=plan.knob_id,
             status=status,
             old_value=old_value,
             new_value=new_value,
+            reason=reason or "",
+            completed_at=completed_at,
         )
         logger.info(
             "optimizer.action.ack",
@@ -224,6 +227,8 @@ class OptimizerContext:
             old_value=old_value,
             new_value=new_value,
             status=status,
+            reason=reason or None,
+            completed_at=completed_at,
         )
         self._publish_ack(ack)
 

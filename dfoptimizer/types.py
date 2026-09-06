@@ -205,6 +205,10 @@ class ActionAck:
     old_value: Any = None
     new_value: Any = None
     reason: str = ""
+    # What the ACTUATOR did, and when it finished, for actuators that relocate data. The planner's
+    # completion rule (T3-0 4s.31) needs both, and without them on the wire it never fired on a real
+    # run: every ack of freeze b, c and d carried reason=None (4s.33).
+    completed_at: Any = None
 
 
 @dc.dataclass

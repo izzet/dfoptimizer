@@ -148,9 +148,22 @@ def tunable(knobs: Dict[str, dict]):
 
             result = func(*args, **kwargs)
 
-            # Send ACKs
+            # Send ACKs, carrying what the actuator actually DID where it can say (4s.33).
+            #
+            # The ack goes out after `func` returns, so by now the target knows whether a
+            # relocation copied, was already in place, or was declined, and when it finished. An
+            # object that does not implement the hook is unaffected.
+            _target = args[0] if args else None
+            _hook = getattr(_target, "_liveflow_ack_reason", None)
             for action, old_val, new_val in applied:
-                ctx.ack_action(action, old_val, new_val, status="applied")
+                _reason, _completed = "", None
+                if callable(_hook):
+                    try:
+                        _reason, _completed = _hook(action.knob_id.split(".")[-1])
+                    except Exception:                      # noqa: BLE001
+                        _reason, _completed = "", None
+                ctx.ack_action(action, old_val, new_val, status="applied",
+                               reason=_reason or "", completed_at=_completed)
 
             return result
 

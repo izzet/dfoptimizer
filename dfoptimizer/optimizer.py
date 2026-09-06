@@ -607,6 +607,8 @@ class Optimizer:
                     new_value=msg.get("new_value"),
                     window_index=msg.get("window_index", -1),
                     target_nodes=msg.get("target_nodes"),
+                    reason=msg.get("reason") or "",
+                    completed_at=msg.get("completed_at"),
                 )
             except Exception:
                 logger.exception("optimizer.acks.error")
