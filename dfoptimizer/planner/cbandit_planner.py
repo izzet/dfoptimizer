@@ -238,6 +238,15 @@ class CoordinateBanditPlanner:
         # optimum in 35 windows with 8 plans. Set to 0 for the ablation.
         self._predicted_effect_gate = os.environ.get(
             "DFOPTIMIZER_CBANDIT_PREDICTED_EFFECT", "1") == "1"
+        # A RELOCATION'S EFFECT BEGINS AT THE NEXT EPOCH BOUNDARY (T3-0 4s.37, 4s.39), so the
+        # admission price is corrected in BOTH directions or in neither:
+        #   horizon   the windows remaining AFTER the boundary, not from the decision,
+        #   gain      capped by the EPOCH's exposure, not by the decision window's.
+        # 4s.37 measured what half the correction does: the horizon alone refuses five of the six
+        # recorded stages, r1b's and r1f's included, both of which paid. The window cap understates
+        # the exposure by about half and the two errors were cancelling.
+        self._reloc_effect_at_boundary = os.environ.get(
+            "DFOPTIMIZER_RELOC_EFFECT_AT_BOUNDARY", "0") == "1"
         # Exploration needs a characterised incumbent (4s.20). Implemented, tested, DEFAULT OFF:
         # it blocks cosmoflow's staging as well as unet3d's move, which is not what was asked for.
         # The derived dwell applied to the ESCALATION verdict, which decides whether a costlier
@@ -836,6 +845,16 @@ class CoordinateBanditPlanner:
                     worse = t > self._z(1.0 - self._alpha)
                 if worse:
                     return short, old_value
+                # A CONFIRMATION LEAVES A RECORD (T3-0 4s.39). Only the revert was ever logged, so
+                # a run that kept a move said nothing about why, and "confirmed" had to be inferred
+                # by replaying the record into a planner and looking at `_move_from` (4s.38). The
+                # paper's claim is a count, and a count has to be readable from the run.
+                logger.info(
+                    "optimizer.cbandit.reloc_confirmed", window=window, knob=short, value=cur,
+                    n=len(cand), mean=round(m, 4), base_mean=round(float(base_mean), 4),
+                    predicted=round(predicted, 4), delta=round(float(delta), 4),
+                    n_required=int(need), sd=round(sd, 4), verdict="confirmed",
+                    reason="the relocated regime is not worse than the size it predicted")
                 self._move_from.pop(short, None)
                 continue
 
@@ -845,6 +864,15 @@ class CoordinateBanditPlanner:
             if accept_decision(base, cand, alpha=self._alpha,
                                effect_floor=self._effect_floor) != "accept":
                 return short, old_value
+            # The symmetric record for an ordinary knob move: two live arms, the same test that
+            # would have reverted it, and the same fields so both kinds count the same way.
+            logger.info(
+                "optimizer.cbandit.move_confirmed", window=window, knob=short, value=cur,
+                n=len(cand), mean=round(statistics.mean(cand), 4),
+                base_n=len(base), base_mean=round(statistics.mean(base), 4),
+                predicted=round(max(statistics.mean(base) - float(delta), 0.0), 4),
+                delta=round(float(delta), 4), n_required=int(need), verdict="confirmed",
+                reason="the moved arm accepts against the arm it left")
             self._move_from.pop(short, None)
         return None
 
@@ -1656,6 +1684,7 @@ class CoordinateBanditPlanner:
                     # The relocation's predicted per-window gain, kept across the candidate loop so
                     # the decision record carries the prediction the run was made on (dev3).
                     reloc_gain_last = None
+                    reloc_horizon_last = None
                     dwell_last = None
                     delta_last = None
                     for cand_short in order:
@@ -1682,6 +1711,20 @@ class CoordinateBanditPlanner:
                         if storage_suspect and cand_short in promoted:
                             cand_exposed = float(doms.get("input", 0.0)) + float(
                                 doms.get("comm", 0.0))
+                        # PRICED ON THE EPOCH'S EXPOSURE, NOT THE DECISION WINDOW'S (4s.39). The
+                        # window a decision happens to be taken in is one sample of a distribution
+                        # this cell spreads over 43 percent: on r1f windows 0 to 2 expose 34.3,
+                        # 15.8 and 9.9 s, and the decision landed on the smallest. The cap is the
+                        # same epoch-to-date lower-bound median the predicted effect already uses,
+                        # so no new estimator and no new constant. Off by default until a rep runs.
+                        if self._reloc_effect_at_boundary and cand_short in self._relocating:
+                            _ep = self._epoch_domain_exposed(dom)
+                            if storage_suspect and cand_short in promoted:
+                                _in = self._epoch_domain_exposed("input") or 0.0
+                                _cm = self._epoch_domain_exposed("comm") or 0.0
+                                _ep = (_in + _cm) or None
+                            if _ep is not None:
+                                cand_exposed = float(_ep)
                         # AND THEN PRICED PHYSICALLY, for a knob that RELOCATES the bytes.
                         # input+comm is what a relocation may be CREDITED with at most, and it is
                         # a BOUND rather than the gain: what the move actually delivers is the
@@ -1719,6 +1762,17 @@ class CoordinateBanditPlanner:
                             if (self._accept_enabled and self._predicted_effect_gate)
                             else (None, "gate_disabled"))
                         rem_w = obs.get("remaining")
+                        # THE HORIZON A RELOCATION IS PAID OVER STARTS AT THE REBUILD (4s.39). The
+                        # windows left in this epoch read the old source whatever the knob says, so
+                        # they cannot repay the copy. Applied to the relocating candidate only:
+                        # every other knob takes effect in the window after the plan.
+                        if (self._reloc_effect_at_boundary and cand_short in self._relocating
+                                and rem_w is not None):
+                            _wpe = obs.get("windows_per_epoch")
+                            if _wpe:
+                                _left = max(float(_wpe) - float(self._epoch_windows), 0.0)
+                                rem_w = max(float(rem_w) - _left, 0.0)
+                                reloc_horizon_last = rem_w
                         if delta is None and self._accept_enabled \
                                 and self._predicted_effect_gate:
                             tried.append({"knob": cand_short, "verdict": "no_predicted_effect",
@@ -1838,6 +1892,7 @@ class CoordinateBanditPlanner:
                                 epoch_src_gbs=_rounded(obs.get("epoch_src_gbs")),
                                 dest_read_gbs=self._dest_read_gbs or None,
                                 reloc_gain_per_window=_rounded(reloc_gain_last),
+                                reloc_horizon_windows=_rounded(reloc_horizon_last),
                                 # The derived dwell's own terms, so a hold can be read back.
                                 dwell=dwell_last,
                                 predicted_effect=delta_last,
