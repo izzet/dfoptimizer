@@ -265,6 +265,14 @@ class CoordinateBanditPlanner:
         # The actuator's own completion instant per relocating knob, and the wall-clock time each
         # window finished. Together they say which windows contain the copy (4s.35).
         self._reloc_live_at: Dict[str, Optional[float]] = {}
+        # WHEN THE NEW SOURCE IS ACTUALLY IN USE, which is not when the copy ended (4s.37).
+        # `data_source` resolves into a file list that the loader reads only when it is REBUILT,
+        # and DLIO rebuilds at the epoch boundary. On `cf_fz_loop_n32_r1f` the copy finished at
+        # 08:13:34 and the loader was rebuilt at 08:21:54, so the eight minutes between them were
+        # PFS windows credited to `local`, the arms tied, and 32 nodes reverted one window before
+        # the effect appeared. The arm is sampled from HERE.
+        self._reloc_effective_at: Dict[str, Optional[float]] = {}
+        self._reloc_pending_logged: Dict[str, int] = {}
         self._window_finished_at: Dict[int, float] = {}
         self._reloc_pending: Dict[str, object] = {}
         # The relocation value already published and not yet resolved by an ack. A second plan for
@@ -311,7 +319,8 @@ class CoordinateBanditPlanner:
 
     def apply_ack(self, plan_id: str = "", knob_id: str = "", status: str = "unknown",
                   old_value=None, new_value=None, window_index: int = -1,
-                  target_nodes=None, reason: str = "", completed_at=None):
+                  target_nodes=None, reason: str = "", completed_at=None,
+                  effective_at=None):
         """Process an ack from the application.
 
         THE BUG THIS FIXES, and it was loud in the log while being invisible in the results.
@@ -335,10 +344,24 @@ class CoordinateBanditPlanner:
         """
         logger.info("optimizer.cbandit.ack", plan_id=plan_id, knob_id=knob_id, status=status,
                     old_value=old_value, new_value=new_value, window_index=window_index,
-                    reason=reason or None, completed_at=completed_at)
+                    reason=reason or None, completed_at=completed_at,
+                    effective_at=effective_at)
         if knob_id not in self.knobs:
             return
         short_id = self._short.get(knob_id, knob_id)
+        # THE SECOND ACK: the actuator says the new source is IN USE (4s.37). It arrives at the
+        # loader rebuild, a later call than the one that copied, so it is its own ack rather than a
+        # field of the first. It reports no move -- the move already happened -- so it is handled
+        # before every branch that reads `reason`, and it changes nothing but the sampling gate. A
+        # run whose actuator never sends it leaves the move PENDING and says so on every window,
+        # which is the honest state: nothing about the new regime has been measured yet.
+        if short_id in self._relocating and effective_at is not None:
+            self._reloc_effective_at[short_id] = float(effective_at)
+            logger.info("optimizer.cbandit.reloc_effective", knob_id=knob_id,
+                        effective_at=float(effective_at), window=self._cur_window,
+                        completed_at=self._reloc_live_at.get(short_id))
+            return
+
         # A RELOCATION THAT DID NOT RELOCATE IS NOT AN APPLICATION (4s.31). The actuator now says
         # why, and a `no_move_needed` or `resolver_declined` ack leaves the planner where it was
         # with the reason on the record rather than booking a move that never happened. It is not a
@@ -356,24 +379,29 @@ class CoordinateBanditPlanner:
             # window the plan was issued in.
             # USE THE TIMESTAMP THE ACTUATOR SENT, NOT A WINDOW INDEX (T3-0 4s.35).
             #
-            # `ActionAck` carries no window index at all, so this fell through to `_cur_window` --
-            # the window the planner happened to be on when the ack was PROCESSED, which on
-            # `cf_fz_loop_n32_r1e` was window 4 while the copy ran for 503 s and finished around
-            # window 22. The arm then recorded the whole staging epoch, `local` looked worse than
-            # the `pfs` mean it left, and all 32 nodes reverted. The replay hid it, because the
-            # replay synthesises the ack with a scaffold offset that happens to be right.
+            # `ActionAck` carries no window index at all, so this falls through to `_cur_window`.
+            # THAT FALLBACK WAS NOT THE FREEZE E DEFECT, and the claim that it was is retracted
+            # (T3-0 4s.36): windows do not advance during the copy, so the window the ack is
+            # processed in IS the first window after it, on r1e and r1f alike. The index is kept
+            # only as the last resort when no timestamp is on the wire.
             #
-            # `completed_at` is the moment the copy returned, so the arm starts at the first window
-            # that FINISHES after it. Windows before that contain the copy and belong to neither
-            # regime.
+            # `completed_at` is the moment the copy returned. Windows that finished before it
+            # contain the copy and belong to neither regime, so they are credited to neither.
+            #
+            # BUT THE COPY ENDING IS NOT THE EFFECT BEGINNING (4s.37). `data_source` resolves into
+            # a file list, and the loader reads that list only when it is REBUILT, at the epoch
+            # boundary. `effective_at` below is when that happened; until it arrives the move is
+            # PENDING, and a pending move is neither confirmed nor reverted.
             self._reloc_live_at[short_id] = (float(completed_at)
                                              if completed_at is not None else None)
             live = window_index if window_index is not None and window_index >= 0 else self._cur_window
             self._reloc_live_from[short_id] = int(live)
             self._reloc_pending.pop(short_id, None)
             self._reloc_published.pop(short_id, None)
+            self._reloc_effective_at.setdefault(short_id, None)
             logger.info("optimizer.cbandit.reloc_completed", knob_id=knob_id,
-                        live_from_window=int(live), completed_at=completed_at)
+                        live_from_window=int(live), completed_at=completed_at,
+                        effective_at=effective_at)
         if status == "applied":
             if new_value is not None:
                 applied = self.knobs[knob_id].clamp(new_value)
@@ -573,13 +601,30 @@ class CoordinateBanditPlanner:
             if short in self._relocating:
                 live_at = self._reloc_live_at.get(short)
                 live_from = self._reloc_live_from.get(short)
+                eff_at = self._reloc_effective_at.get(short)
                 if live_from is None and live_at is None and short in self._reloc_pending:
                     continue                      # relocation acked, completion not yet seen
-                if live_at is not None:
-                    # The timestamp wins: a window that finished before the copy did contains the
-                    # copy, whatever window index the ack arrived on.
+                # THE COPY ENDING IS NOT THE EFFECT BEGINNING (4s.37). Between the two the loader
+                # is still reading the OLD file list, so those windows measure the old source at
+                # the new source's name. On `cf_fz_loop_n32_r1f` that was every window from 4 to
+                # 20: PFS windows of 14 to 66 s credited to `local`, against a `pfs` arm of 25 s,
+                # which is why the two arms tied and 32 nodes reverted one window before the
+                # rebuild. Until the actuator says the new source is in use, the arm has no
+                # samples, and that is not a gap in the record: it is the record.
+                if live_at is not None and eff_at is None and short in self._reloc_effective_at:
+                    if self._reloc_pending_logged.get(short) != self._cur_window:
+                        self._reloc_pending_logged[short] = self._cur_window
+                        logger.info("optimizer.cbandit.reloc_pending_effect", knob=short,
+                                    window=self._cur_window, level_=str(level),
+                                    completed_at=live_at,
+                                    reason="copy finished, the loader has not been rebuilt on it")
+                    continue
+                gate = eff_at if eff_at is not None else live_at
+                if gate is not None:
+                    # The timestamp wins: a window that finished before the gate contains the copy
+                    # or the old source, whatever window index the ack arrived on.
                     fin = self._window_finished_at.get(self._cur_window)
-                    if fin is not None and fin < live_at:
+                    if fin is not None and fin < gate:
                         continue
                 elif live_from is not None and self._cur_window < live_from:
                     continue
@@ -769,6 +814,13 @@ class CoordinateBanditPlanner:
             # post-move regime is significantly WORSE than what was predicted for it. Same alpha,
             # no new constant. A knob move keeps the two-arm test unchanged, which is what D1 checks.
             if short in self._relocating:
+                # PENDING IS NOT A VERDICT (4s.37). A relocation whose loader has not been rebuilt
+                # has no post-move sample at all, so there is nothing to confirm and nothing to
+                # refuse. Freeze f reverted 32 nodes in exactly this state, one window before the
+                # rebuild would have shown the effect.
+                if (short in self._reloc_effective_at
+                        and self._reloc_effective_at.get(short) is None):
+                    continue
                 if not base_mean or base_mean <= 0:
                     continue
                 need, _ = self.required_dwell(remaining, short=short, value=cur, delta=delta)
@@ -1820,6 +1872,9 @@ class CoordinateBanditPlanner:
                                 # Until the actuator's completion arrives, this arm records nothing.
                                 self._reloc_pending[short] = completed
                                 self._reloc_live_from.pop(short, None)
+                                self._reloc_live_at.pop(short, None)
+                                self._reloc_effective_at.pop(short, None)
+                                self._reloc_pending_logged.pop(short, None)
                             _base_n, _base_mean = self._stats.get((short, cur), (0, 0.0))
                             self._move_from[short] = (cur, (delta_last or {}).get("delta"),
                                                       completed, _base_mean)

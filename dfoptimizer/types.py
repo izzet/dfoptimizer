@@ -209,6 +209,11 @@ class ActionAck:
     # completion rule (T3-0 4s.31) needs both, and without them on the wire it never fired on a real
     # run: every ack of freeze b, c and d carried reason=None (4s.33).
     completed_at: Any = None
+    # WHEN THE CHANGE ACTUALLY TOOK EFFECT, which for a relocation is not when the copy ended
+    # (T3-0 4s.37). `data_source` resolves into a file list the loader reads only when it is
+    # rebuilt, so the two instants are an epoch apart and every window between them measures the
+    # OLD source. Carried on a second ack sent from the rebuild.
+    effective_at: Any = None
 
 
 @dc.dataclass

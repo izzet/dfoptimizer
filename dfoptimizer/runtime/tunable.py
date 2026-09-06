@@ -159,11 +159,26 @@ def tunable(knobs: Dict[str, dict]):
                 _reason, _completed = "", None
                 if callable(_hook):
                     try:
-                        _reason, _completed = _hook(action.knob_id.split(".")[-1])
+                        _hooked = _hook(action.knob_id.split(".")[-1])
+                        _reason, _completed = (_hooked or (None, None))[:2]
                     except Exception:                      # noqa: BLE001
                         _reason, _completed = "", None
                 ctx.ack_action(action, old_val, new_val, status="applied",
                                reason=_reason or "", completed_at=_completed)
+                # A CHANGE THAT TAKES EFFECT LATER GETS TO SAY SO LATER (T3-0 4s.37).
+                #
+                # A relocation's copy ends inside this call; the loader that reads the moved bytes
+                # is not built until the next epoch boundary, and every window in between measures
+                # the OLD source. One ack cannot carry both instants, so the target is handed the
+                # plan and sends its own second ack, with `effective_at`, from wherever the change
+                # actually starts being true. A target without the hook is unaffected.
+                _defer = getattr(_target, "_liveflow_ack_pending", None)
+                if callable(_defer):
+                    try:
+                        _defer(action, old_val, new_val, ctx)
+                    except Exception:                      # noqa: BLE001
+                        logger.warning("optimizer.tunable.defer_failed",
+                                       knob=action.knob_id, plan_id=action.plan_id)
 
             return result
 
