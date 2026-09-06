@@ -672,7 +672,9 @@ class CoordinateBanditPlanner:
         moved value has `n_required(delta)` observations, and only when `accept_decision` refuses.
         Returns None otherwise, which is the common case.
         """
-        for short, (old_value, delta, _w) in list(self._move_from.items()):
+        for short, entry in list(self._move_from.items()):
+            old_value, delta, _w = entry[0], entry[1], entry[2]
+            base_mean = entry[3] if len(entry) > 3 else None
             if not delta or delta <= 0:
                 continue
             cur = self._short_cfg().get(short)
@@ -681,6 +683,39 @@ class CoordinateBanditPlanner:
                 continue
             cand = list(self._samples.get((short, cur), ()))
             base = list(self._samples.get((short, old_value), ()))
+
+            # A RELOCATION IS VERIFIED AGAINST THE REGIME IT LEFT, NOT AGAINST A LIVE ARM.
+            #
+            # T3-0 4s.30. After a relocation the incumbent is never sampled again, so its arm holds
+            # only PRE-move windows, and `accept_decision` then compares two different regimes as if
+            # they were two arms of one. On `cf_fz_loop_n32_r1b` that compared `pfs` at 26.85 s,
+            # four windows taken before the copy, against `local` at 32.38 s, ten windows taken
+            # DURING the staging epoch and including the copy's own cost, and reverted the decision
+            # that went on to run the cell at 5.6 s per window.
+            #
+            # So the baseline is the pre-move mean recorded at the move, the sample size is the
+            # post-move `n_required` for the predicted effect, and the question asked is whether the
+            # post-move regime is significantly WORSE than what was predicted for it. Same alpha,
+            # no new constant. A knob move keeps the two-arm test unchanged, which is what D1 checks.
+            if short in self._relocating:
+                if not base_mean or base_mean <= 0:
+                    continue
+                need, _ = self.required_dwell(remaining, short=short, value=cur, delta=delta)
+                if len(cand) < max(need, self._min_samples):
+                    continue
+                predicted = max(float(base_mean) - float(delta), 0.0)
+                m = statistics.mean(cand)
+                sd = statistics.stdev(cand) if len(cand) > 1 else 0.0
+                if sd <= 0.0:
+                    worse = m > predicted
+                else:
+                    t = (m - predicted) / (sd / math.sqrt(len(cand)))
+                    worse = t > self._z(1.0 - self._alpha)
+                if worse:
+                    return short, old_value
+                self._move_from.pop(short, None)
+                continue
+
             need, _ = self.required_dwell(remaining, short=short, value=old_value, delta=delta)
             if len(cand) < need or len(base) < self._min_samples:
                 continue
@@ -1706,8 +1741,13 @@ class CoordinateBanditPlanner:
                         self._last_move_window[short] = completed
                         # What this move predicted, so it can be checked at that size later.
                         if choice != cur:
+                            # The pre-move regime's mean is recorded AT THE MOVE, because after a
+                            # relocation the incumbent's arm stops being sampled and the only
+                            # honest baseline is the one that existed when the decision was taken
+                            # (T3-0 4s.30).
+                            _base_n, _base_mean = self._stats.get((short, cur), (0, 0.0))
                             self._move_from[short] = (cur, (delta_last or {}).get("delta"),
-                                                      completed)
+                                                      completed, _base_mean)
                     nxt = dict(cfg_now)
                     nxt[short] = choice
                     self._planned_cfg[w + 1] = dict(nxt)
