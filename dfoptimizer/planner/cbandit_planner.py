@@ -257,6 +257,11 @@ class CoordinateBanditPlanner:
         self._epoch_dom: Dict[str, Deque[float]] = {}
         # What a move predicted, so it can be reverted if it is not confirmed at that size.
         self._move_from: Dict[str, tuple] = {}
+        # A RELOCATED ARM IS SAMPLED FROM THE ACTUATOR'S COMPLETION, NOT FROM THE PLAN (4s.31).
+        # The copy's own windows are neither the old regime nor the new one, so they are credited to
+        # neither. Set when an ack arrives with reason `relocated`; cleared when the arm moves again.
+        self._reloc_live_from: Dict[str, int] = {}
+        self._reloc_pending: Dict[str, object] = {}
 
     # --- Planner-compatible registration (identical contract to Planner/CLBOPlanner) ---
     def register_knobs(self, knob_defs, current_values=None):
@@ -297,7 +302,7 @@ class CoordinateBanditPlanner:
 
     def apply_ack(self, plan_id: str = "", knob_id: str = "", status: str = "unknown",
                   old_value=None, new_value=None, window_index: int = -1,
-                  target_nodes=None):
+                  target_nodes=None, reason: str = "", completed_at=None):
         """Process an ack from the application.
 
         THE BUG THIS FIXES, and it was loud in the log while being invisible in the results.
@@ -320,9 +325,30 @@ class CoordinateBanditPlanner:
         arm from the search.
         """
         logger.info("optimizer.cbandit.ack", plan_id=plan_id, knob_id=knob_id, status=status,
-                    old_value=old_value, new_value=new_value, window_index=window_index)
+                    old_value=old_value, new_value=new_value, window_index=window_index,
+                    reason=reason or None, completed_at=completed_at)
         if knob_id not in self.knobs:
             return
+        short_id = self._short.get(knob_id, knob_id)
+        # A RELOCATION THAT DID NOT RELOCATE IS NOT AN APPLICATION (4s.31). The actuator now says
+        # why, and a `no_move_needed` or `resolver_declined` ack leaves the planner where it was
+        # with the reason on the record rather than booking a move that never happened. It is not a
+        # revert either: nothing was done, so there is nothing to undo.
+        if short_id in self._relocating and status == "applied" and reason and reason != "relocated":
+            logger.info("optimizer.cbandit.ack.not_applied", knob_id=knob_id, reason=reason,
+                        stayed_on=self.current_values.get(knob_id),
+                        note="actuator reported no relocation; incumbent unchanged")
+            self._move_from.pop(short_id, None)
+            self._reloc_pending.pop(short_id, None)
+            return
+        if short_id in self._relocating and status == "applied" and reason == "relocated":
+            # Sampling of the new arm starts HERE, at the window the copy finished in, not at the
+            # window the plan was issued in.
+            live = window_index if window_index is not None and window_index >= 0 else self._cur_window
+            self._reloc_live_from[short_id] = int(live)
+            self._reloc_pending.pop(short_id, None)
+            logger.info("optimizer.cbandit.reloc_completed", knob_id=knob_id,
+                        live_from_window=int(live), completed_at=completed_at)
         if status == "applied":
             if new_value is not None:
                 applied = self.knobs[knob_id].clamp(new_value)
@@ -512,6 +538,17 @@ class CoordinateBanditPlanner:
         built for.
         """
         for short, level in cfg.items():
+            # THE COPY'S OWN WINDOWS BELONG TO NEITHER REGIME (4s.31). Between the plan and the
+            # actuator's completion the node is copying hundreds of GB while still reading the old
+            # source, so those windows measure the move, not the state it moves to. Crediting them
+            # to the new level is what made `local` look 32.4 s when the regime it bought runs at
+            # 5.5, and reverted it nine windows before its evidence existed.
+            if short in self._relocating:
+                live_from = self._reloc_live_from.get(short)
+                if live_from is None and short in self._reloc_pending:
+                    continue                      # relocation acked, completion not yet seen
+                if live_from is not None and self._cur_window < live_from:
+                    continue
             n, mean = self._stats.get((short, level), (0, 0.0))
             self._stats[(short, level)] = (n + 1, mean + (wall - mean) / (n + 1))
             buf = self._samples.get((short, level))
@@ -1745,6 +1782,10 @@ class CoordinateBanditPlanner:
                             # relocation the incumbent's arm stops being sampled and the only
                             # honest baseline is the one that existed when the decision was taken
                             # (T3-0 4s.30).
+                            if short in self._relocating:
+                                # Until the actuator's completion arrives, this arm records nothing.
+                                self._reloc_pending[short] = completed
+                                self._reloc_live_from.pop(short, None)
                             _base_n, _base_mean = self._stats.get((short, cur), (0, 0.0))
                             self._move_from[short] = (cur, (delta_last or {}).get("delta"),
                                                       completed, _base_mean)
