@@ -708,12 +708,29 @@ class Planner:
 
     def apply_ack(self, plan_id: str, knob_id: str, status: str,
                   old_value=None, new_value=None, window_index: int = -1,
-                  target_nodes: Optional[List[str]] = None):
+                  target_nodes: Optional[List[str]] = None, **_forward_compat):
         """Process an ACK from the app.
 
         Clears the pending-plan gate for this knob and starts cooldown
         from the APPLICATION window (not the publish window).  The severity
         recorded at plan-creation time is used for effectiveness tracking.
+
+        `**_forward_compat` ACCEPTS AND IGNORES the fields the ack has grown since this planner was
+        written -- `reason`, `completed_at`, `effective_at` -- and it is a correctness fix for the
+        ABLATION, not a feature (T3-0 4s.44).
+
+        `Optimizer._ack_loop` passes them positionally by name to whatever planner is configured,
+        so on the legacy path every ack raised TypeError, was swallowed by the loop's `except
+        Exception`, and NONE of this method ran. `cf_fz_gated_n32_r1` recorded 512
+        `optimizer.acks.error` and ZERO `optimizer.ack.received` across its 32 agents. The
+        consequence is not cosmetic: `_pending_plans` is cleared HERE and nowhere else, and
+        `process_finding` skips any knob that still has an entry, so after the arm's two plans at
+        window 25 neither knob could ever be planned again. The arm's silence over its remaining
+        fifty windows was our regression, not the legacy method.
+
+        Ignoring the new fields is exactly right for this planner: it has no relocation, no
+        completion rule and no notion of an effect beginning later. The fix RESTORES the behaviour
+        the ablation is supposed to exhibit rather than changing it.
         """
         # Determine node scope from the plan's target_nodes.
         node = target_nodes[0] if target_nodes else ""
