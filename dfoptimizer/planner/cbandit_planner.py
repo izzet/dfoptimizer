@@ -56,6 +56,7 @@ outside the objective is consulted. It is a search policy.
 from __future__ import annotations
 
 import math
+import random
 import time as _time
 import statistics
 import os
@@ -247,6 +248,9 @@ class CoordinateBanditPlanner:
         # the exposure by about half and the two errors were cancelling.
         self._reloc_effect_at_boundary = os.environ.get(
             "DFOPTIMIZER_RELOC_EFFECT_AT_BOUNDARY", "0") == "1"
+        # median | hoeffding | bootstrap. See _domain_bound: measured on all three, median shipped.
+        self._domain_delta_bound = os.environ.get(
+            "DFOPTIMIZER_DOMAIN_DELTA_BOUND", "median").strip().lower()
         # Exploration needs a characterised incumbent (4s.20). Implemented, tested, DEFAULT OFF:
         # it blocks cosmoflow's staging as well as unet3d's move, which is not what was asked for.
         # The derived dwell applied to the ESCALATION verdict, which decides whether a costlier
@@ -926,8 +930,41 @@ class CoordinateBanditPlanner:
         vals = [v for v in (self._epoch_dom.get(dom) or ()) if v is not None]
         if not vals:
             return None
-        lb = self._median_lower_bound(vals, self._alpha)
+        lb = self._domain_bound(vals)
         return lb if lb and lb > 0.0 else None
+
+    def _domain_bound(self, vals):
+        """The lower confidence bound on the domain's per-window exposure.
+
+        THREE ESTIMATORS, ONE SHIPPED (T3-0 4s.42). The median's bound is what 4s.24 chose and what
+        every quoted result was taken on. The two mean bounds exist because a bimodal exposure --
+        StorMer stalls on one step in `num_workers`, so at a cadence that does not divide the period
+        some windows carry the whole stall and the rest carry none -- puts the median near zero
+        while the mean is seconds. Both are distribution free at the same alpha:
+
+            hoeffding   mean - range * sqrt(ln(1/alpha) / 2n)
+            bootstrap   the alpha-quantile of the resampled mean
+
+        MEASURED, AND NEITHER IS ADOPTED: on `stcz2_loop_r1` with the stall on the wire the three
+        give 0.0143, 0.1871 and 1.0674 s against a window-wall sigma of 7.14, so `n_required` is
+        1,948,687 / 11,444 / 352 against a horizon of 14. The estimator is not what blocks that
+        cell; the cadence is, and a window that spans a whole stall period makes the series
+        unimodal and the median sound again. Default stays `median`.
+        """
+        if self._domain_delta_bound == "hoeffding":
+            n = len(vals)
+            if n < 2:
+                return None
+            rng = max(vals) - min(vals)
+            return (sum(vals) / n) - rng * math.sqrt(math.log(1.0 / self._alpha) / (2.0 * n))
+        if self._domain_delta_bound == "bootstrap":
+            n = len(vals)
+            if n < 2:
+                return None
+            rnd = random.Random(1729)          # fixed seed: a decision must be reproducible
+            means = sorted(sum(rnd.choices(vals, k=n)) / n for _ in range(2000))
+            return means[int(self._alpha * len(means))]
+        return self._median_lower_bound(vals, self._alpha)
 
     def predicted_effect(self, short: str, dom: str,
                          reloc_gain: Optional[float] = None) -> Tuple[Optional[float], str]:
