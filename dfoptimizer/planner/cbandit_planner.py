@@ -251,6 +251,13 @@ class CoordinateBanditPlanner:
         # median | hoeffding | bootstrap. See _domain_bound: measured on all three, median shipped.
         self._domain_delta_bound = os.environ.get(
             "DFOPTIMIZER_DOMAIN_DELTA_BOUND", "median").strip().lower()
+        # A KNOB ABOVE A MEASURED CAPACITY (T3-0 4s.43). Both numbers are machine measurements with
+        # provenance, not thresholds: the node's processor count and the ranks placed on it. Absent
+        # -- which is the default -- the rule is off and nothing changes.
+        self._capacity_knob = os.environ.get("DFOPTIMIZER_CAPACITY_KNOB", "").strip()
+        self._capacity_procs = _num_or_none(os.environ.get("DFOPTIMIZER_CAPACITY_PROCS_PER_NODE"))
+        self._capacity_ranks = _num_or_none(os.environ.get("DFOPTIMIZER_CAPACITY_RANKS_PER_NODE"))
+        self._capacity_step = os.environ.get("DFOPTIMIZER_CAPACITY_STEP", "one").strip().lower()
         # Exploration needs a characterised incumbent (4s.20). Implemented, tested, DEFAULT OFF:
         # it blocks cosmoflow's staging as well as unet3d's move, which is not what was asked for.
         # The derived dwell applied to the ESCALATION verdict, which decides whether a costlier
@@ -933,7 +940,53 @@ class CoordinateBanditPlanner:
         lb = self._domain_bound(vals)
         return lb if lb and lb > 0.0 else None
 
+    def _capacity_limit(self, short: str) -> Optional[float]:
+        """The largest value of `short` the node's own processors can hold, or None.
+
+        MEASURED, NOT CHOSEN (T3-0 4s.43). A worker knob spends processes: each rank runs one main
+        process plus `value` workers, and the node has a processor count. So
+
+            limit = procs_per_node / ranks_per_node - 1
+
+        is arithmetic on two measurements, which is what the method's no-threshold rule requires.
+        On Corona, 48 physical cores and 8 ranks per node give a limit of 5, and the shipped
+        `num_workers=8` places 72 processes on 48 cores.
+
+        None whenever either measurement is missing or the knob is not the one that spends them,
+        and then every rule below is inert. An absent measurement is not a capacity of infinity.
+        """
+        if not self._capacity_knob or short != self._capacity_knob:
+            return None
+        if not self._capacity_procs or not self._capacity_ranks:
+            return None
+        if self._capacity_ranks <= 0:
+            return None
+        return max(float(self._capacity_procs) / float(self._capacity_ranks) - 1.0, 0.0)
+
+    def _measured_decrease_effect(self, short: str, cur, lower) -> Optional[float]:
+        """What DECREASING `short` from `cur` to `lower` was worth, from this run's own samples.
+
+        THE DEFECT THIS ADDRESSES. `predicted_effect` prices a knob move at the exposed time of the
+        domain the knob OWNS, which is a lower bound on the true effect whenever a knob's cost falls
+        outside its own domain -- and over-provisioning is exactly that case: extra workers cost
+        CPU that the compute stage pays for, so the input domain cannot see them. Measured twice:
+        cosmoflow's relocation realised 6 to 12 s per window more than the read-time price (4s.37),
+        and StorMer's W=8 to W=4 is 22 percent of the step in the static sweep against a priced
+        0.5 s (4s.43).
+
+        This is the honest form: the difference between the two arms' observed walls, which needs
+        the lower value to have been VISITED. It returns None when it has not, and the caller then
+        has no measured effect to admit on -- the floor the method's own rules impose.
+        """
+        hi = list(self._samples.get((short, cur), ()))
+        lo = list(self._samples.get((short, lower), ()))
+        if len(hi) < self._min_samples or len(lo) < self._min_samples:
+            return None
+        d = (sum(hi) / len(hi)) - (sum(lo) / len(lo))
+        return d if d > 0 else None
+
     def _domain_bound(self, vals):
+
         """The lower confidence bound on the domain's per-window exposure.
 
         THREE ESTIMATORS, ONE SHIPPED (T3-0 4s.42). The median's bound is what 4s.24 chose and what
@@ -1810,6 +1863,68 @@ class CoordinateBanditPlanner:
                                 _left = max(float(_wpe) - float(self._epoch_windows), 0.0)
                                 rem_w = max(float(rem_w) - _left, 0.0)
                                 reloc_horizon_last = rem_w
+                        # A DECREASE BELOW A MEASURED CAPACITY IS ADMISSIBLE ON THE MEASUREMENT
+                        # THAT SAYS IT IS OVER-PROVISIONED (4s.43).
+                        #
+                        # Priced first from this run's own two arms, which is the honest form and
+                        # needs the lower value to have been visited. When it has not, the capacity
+                        # comparison itself is the admission: the node cannot hold the processes
+                        # this value asks for, the lower neighbour has never been tried, and the
+                        # cost of finding out is one loader rebuild. That is the SAME
+                        # explore-an-untried-neighbour path a relocation is admitted on, and it is
+                        # what a per-domain predicted effect can never reach, because the cost of
+                        # over-provisioning is not in the domain the knob owns.
+                        _cap = self._capacity_limit(cand_short)
+                        _cap_admit = None
+                        if _cap is not None and _num(cand_cur) > _cap:
+                            _lower = [v for v in (self._levels.get(cand_short) or [])
+                                      if _num(v) < _num(cand_cur)]
+                            if _lower:
+                                # ONE COORDINATE STEP by default, which is the search this planner
+                                # is: it descends 8 -> 6 -> 4 and learns what each level is worth.
+                                # `to_limit` jumps straight to the highest level the capacity can
+                                # hold, which reaches 4 in one move and never measures 6. Both are
+                                # measured; the difference is what the run ends up knowing.
+                                _fit = [v for v in _lower if _num(v) <= _cap]
+                                _next_down = (max(_fit, key=_num) if (_fit and self._capacity_step
+                                                                      == "to_limit")
+                                              else max(_lower, key=_num))
+                                _meas = self._measured_decrease_effect(
+                                    cand_short, cand_cur, _next_down)
+                                _cap_admit = (_next_down, _meas)
+                                if _meas is not None:
+                                    delta, delta_src = _meas, "measured_decrease"
+                                elif delta is None:
+                                    delta, delta_src = None, "capacity_over_provisioned"
+                                logger.info(
+                                    "optimizer.cbandit.capacity", window=completed,
+                                    knob=cand_short, value=cand_cur, limit=round(_cap, 3),
+                                    to=_next_down,
+                                    measured_effect=(round(_meas, 4) if _meas else None),
+                                    procs_per_node=self._capacity_procs,
+                                    ranks_per_node=self._capacity_ranks,
+                                    reason="the node cannot hold the processes this value asks for")
+                        if (delta is None and _cap_admit is not None
+                                and self._accept_enabled and self._predicted_effect_gate):
+                            # Untried lower neighbour under a measured capacity: explore it.
+                            _to = _cap_admit[0]
+                            if not self._samples.get((cand_short, _to)):
+                                nxt = dict(self._short_cfg())
+                                nxt[cand_short] = _to
+                                self._planned_cfg[w + 1] = dict(nxt)
+                                self._last_move_window[cand_short] = completed
+                                _bn, _bm = self._stats.get((cand_short, cand_cur), (0, 0.0))
+                                self._move_from[cand_short] = (cand_cur, None, completed, _bm)
+                                logger.info(
+                                    "optimizer.cbandit.decision", window=completed,
+                                    decision="move", knob=cand_short, current=cand_cur, chose=_to,
+                                    accept="explore_over_provisioned",
+                                    dominant_domain=dom, domain_times={
+                                        k: round(float(v), 4) for k, v in doms.items()},
+                                    capacity_limit=round(_cap, 3), gain_s=0.0, cost_s=0.0,
+                                    horizon_count=rem_w, horizon_unit=obs.get("remaining_unit"),
+                                    wall=round(float(wall), 4), candidates=[])
+                                return self._plans_for(nxt, finding, dom)
                         if delta is None and self._accept_enabled \
                                 and self._predicted_effect_gate:
                             tried.append({"knob": cand_short, "verdict": "no_predicted_effect",
