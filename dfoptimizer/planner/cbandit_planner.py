@@ -1894,7 +1894,22 @@ class CoordinateBanditPlanner:
                                 _cap_admit = (_next_down, _meas)
                                 if _meas is not None:
                                     delta, delta_src = _meas, "measured_decrease"
-                                elif delta is None:
+                                elif _cap_admit is not None:
+                                    # FREEZE I FIX (T3-0 4s.54, 2026-09-07): was `elif delta is
+                                    # None`, which only blanked the per-domain price when one was
+                                    # already absent -- so a capacity admission SURVIVED only when
+                                    # there was nothing to override it, and was silently vetoed
+                                    # whenever `predicted_effect` had already set `delta` to the
+                                    # owned domain's exposure, which is exactly the over-provisioned
+                                    # case (4s.43: the domain a knob owns cannot see the cost of
+                                    # over-provisioning). The capacity finding is a claim about the
+                                    # NODE; the domain price is a claim about one DOMAIN's exposure;
+                                    # the first must not be outranked by the second. Blanking `delta`
+                                    # whenever a capacity admission exists (not only when it was
+                                    # already None) lets the explore-an-untried-neighbour path below
+                                    # fire on its own terms, and stops `required_dwell` downstream
+                                    # (guarded on `delta is not None`) from ever sizing a dwell off a
+                                    # number the method has established cannot see this cost.
                                     delta, delta_src = None, "capacity_over_provisioned"
                                 logger.info(
                                     "optimizer.cbandit.capacity", window=completed,
