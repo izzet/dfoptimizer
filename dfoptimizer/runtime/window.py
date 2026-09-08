@@ -156,11 +156,28 @@ class Window:
     def counter(self) -> int:
         return self._counter
 
-    def start(self) -> bool:
+    def now(self) -> Optional[int]:
+        """The tracer's clock, for a caller that must open a window at a moment it has passed.
+
+        The window's wall has to be on the SAME clock as `start()` would have read, so a caller
+        cannot substitute `time.time()` here even where the two happen to agree today.
+        """
+        return None if self._dft is None else self._dft.get_time()
+
+    def start(self, at_time: Optional[int] = None) -> bool:
         """Called at every logical iteration start.
 
         Increments the internal counter. Emits a ``window.start`` event
         only when the counter hits the cadence boundary (``counter % every_n == 1``).
+
+        `at_time`, when given, is when the window LOGICALLY began, which is not always when this
+        call happens. A loop shaped `for batch in loader:` has already blocked on the fetch by the
+        time the body runs, so a window opened here excludes the fetch that opened it while the
+        stall accumulator drained at its close includes it. That is not a rounding difference: on
+        `stgi_capacity_gate1` the run's first window carried 11.96 s of stall against a wall of
+        36.42 s that did not contain it, and the four domains summed to 131 percent of the window
+        as a result (STATUS-ATTRIBUTION-FIX-2026-09-08.md section 3, defect C2). Callers pass the
+        instant the previous step ended, which is where the fetch began.
 
         Returns True if a window boundary was emitted, False otherwise.
         """
@@ -173,7 +190,7 @@ class Window:
         self._window_index += 1
         self._active = True
         if self._dft is not None:
-            self._start_time = self._dft.get_time()
+            self._start_time = at_time if at_time is not None else self._dft.get_time()
             self._dft.enter_event()
             self._dft.log_event(
                 name="window.start",

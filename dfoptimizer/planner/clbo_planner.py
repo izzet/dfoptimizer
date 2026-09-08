@@ -88,6 +88,42 @@ def domains_from_metrics(m: Dict[str, float]) -> Dict[str, float]:
     that cost was doing and is kept for choosing WHICH knob to move inside the input domain -- it
     is a within-domain diagnostic, not a domain time.
     """
+    # THE COHERENT VECTOR FIRST (2026-09-08, STATUS-ATTRIBUTION-FIX-2026-09-08.md).
+    #
+    # Everything below this block reads `<layer>_time_proc_max`, which is a maximum over processes
+    # taken SEPARATELY per layer. In a lockstep collective the rank that starves on input waits in
+    # `stall` and the ranks waiting for it at the barrier wait in `comm`, so those two maxima come
+    # from opposite ranks and the four numbers are not a decomposition of anything. Measured on
+    # `stgi_capacity_gate1` they sum to 96 to 139 percent of the window while every individual rank
+    # closes to 99.5 percent of it.
+    #
+    # `domain_*_time_proc_crit` is the whole vector of ONE process, the one on the critical path
+    # through the data pipeline, so it closes on that process's wall by construction. It is the
+    # right vector for pricing a knob: every other rank's comm is inflated by this rank's stall, so
+    # relieving its input relieves their comm too. `domain_coherent` says whether the analyzer path
+    # that produced this window could build it at all; when it could not, we fall back to the old
+    # metrics rather than pricing a vector we know does not close.
+    if float(m.get("domain_coherent", 0.0) or 0.0) >= 1.0 \
+            and "domain_input_time_proc_crit" in m:
+        vec = {
+            "input": float(m.get("domain_input_time_proc_crit", 0.0) or 0.0),
+            "decode": float(m.get("domain_decode_time_proc_crit", 0.0) or 0.0),
+            "comm": float(m.get("domain_comm_time_proc_crit", 0.0) or 0.0),
+            "compute": float(m.get("domain_compute_time_proc_crit", 0.0) or 0.0),
+        }
+        m["domain_exposure_present"] = 1.0
+        m["domain_exposure_fallback"] = 0.0
+        logger.info(
+            "optimizer.domains.coherent",
+            source="domain_*_time_proc_crit",
+            residual=float(m.get("residual_time_proc_crit", 0.0) or 0.0),
+            wall=float(m.get("window_wall_time_proc_crit", 0.0) or 0.0),
+            input_spread=float(m.get("domain_input_spread_time_proc", 0.0) or 0.0),
+            procs_active=float(m.get("domain_procs_active", 0.0) or 0.0),
+            **vec,
+        )
+        return vec
+
     fetch = float(m.get("fetch_iter_time_proc_max", 0.0) or 0.0)
     storage_exposure_key = "stall_storage_time_proc_max"
     decode_exposure_key = "stall_decode_time_proc_max"
