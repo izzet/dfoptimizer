@@ -137,6 +137,28 @@ class CoordinateBanditPlanner:
         # knob per window, chosen by least pulls -- which, because _record credits every knob every
         # window, was always the first-registered knob and never any other). See process_finding.
         self._escalate = os.environ.get("DFOPTIMIZER_CBANDIT_ESCALATE", "1") != "0"
+        # C1 ABLATION (DESIGN-MOVING-BOTTLENECK-2026-09-07, STATUS-ABLATION-MAP-2026-09-07): the
+        # controller keeps its full knob set and its ordinary acquisition; it is only denied WHICH
+        # domain is exposed. Collapses the per-domain breakdown to one aggregate "wall" entry that
+        # no registered knob owns (`self._domain` never maps a knob to "wall"), so the existing
+        # ownership check a few lines below this in `plan()` declines every window. This is not a
+        # policy choice: giving a domain-blind controller some OTHER way to pick a knob (e.g. least-
+        # recently-tried) would not be this planner made blind to domains, it would be a different
+        # planner, so no such fallback is invented here. Default 0 = today's behaviour exactly.
+        self._domain_blind = os.environ.get("DFOPTIMIZER_CBANDIT_DOMAIN_BLIND", "0") == "1"
+        # C2 ABLATION: guards ONLY the unconditional decline at `if ranked and ranked[0][1] not in
+        # actionable`, leaving `_accept_move`'s significance/effect-size test completely alone.
+        # This is deliberately NOT `DFOPTIMIZER_CBANDIT_ACCEPT=0` (the "no-gate" run tag), which
+        # disables a different mechanism (the Welch/effect-floor acceptance test) and would leave
+        # the ownership decline fully intact. Default 0 = today's behaviour exactly.
+        self._always_act = os.environ.get("DFOPTIMIZER_CBANDIT_ALWAYS_ACT", "0") == "1"
+        # C3 ABLATION: prices a relocation's gain WITHOUT weighing it against the run remaining.
+        # Cost weighting (`DFOPTIMIZER_CBANDIT_COST_W`) is untouched -- this only removes the two
+        # horizon terms: `_pick`'s `gain_s = gain_per_window_s * remaining` and the outer
+        # `bool(rem_w)` half of `verifiable`. Default 1 = today's behaviour exactly (note the
+        # inverted default: this one is ON by default, like `_escalate`/`_accept_enabled`, so
+        # unsetting it is the ablation).
+        self._horizon_weight = os.environ.get("DFOPTIMIZER_CBANDIT_HORIZON_WEIGHT", "1") != "0"
         # THE ONLY NEW CONSTANT the barrier-attribution rule introduces, and it is a per-cluster
         # MEASUREMENT with provenance in liveflow_shm/tests/cluster_*.env, not a tuned number. Unset
         # is a supported state: the rule still redirects a comm-dominant window to the storage
@@ -1339,8 +1361,16 @@ class CoordinateBanditPlanner:
                 gain_per_window_s = max(cur_mean - (mean - bonus), 0.0)
                 if exposed_s is not None:
                     gain_per_window_s = min(gain_per_window_s, max(float(exposed_s), 0.0))
-            gain_s = (gain_per_window_s * remaining
-                      if remaining is not None else None)
+            # C3 ABLATION (`_horizon_weight`): a relocation's one-time cost is normally repaid
+            # from `gain_per_window_s * remaining` -- the run left to amortise it. With horizon
+            # weighting off, price a SINGLE window's gain against the FULL cost instead, whatever
+            # `remaining` says: cost weighting (`_cost_w`) is untouched, only the horizon term is
+            # gone. This can fail in both directions the design predicts: a real early gain that
+            # would have repaid over many windows now looks unpayable against one window's worth,
+            # and (paired with the `verifiable` change below) a late-run move that should be
+            # refused for lack of horizon no longer has that veto either.
+            gain_s = (gain_per_window_s if not self._horizon_weight else
+                      (gain_per_window_s * remaining if remaining is not None else None))
             payable = (lv == current or self._cost_w == 0.0 or cost_s <= 0.0
                        or (gain_s is not None and gain_s > weighted_cost_s))
 
@@ -1649,8 +1679,14 @@ class CoordinateBanditPlanner:
             # 1. CROSS-LAYER DIRECTION: the dominant domain by measured time. A comparison, not a
             #    threshold -- this is the part the paper's contribution rests on.
             doms = obs["domains"]
-            actionable = {d for d in self._domain.values()}
             wall = obs["wall"]
+            if self._domain_blind:
+                # C1 ABLATION. Collapse the breakdown to one aggregate entry that no registered
+                # knob owns (see the `_domain_blind` comment in __init__). `domain_times` on the
+                # decision record below will show this single "wall" key, which is the mechanism
+                # signature a reader checks for -- not whether a knob moved.
+                doms = {"wall": float(wall)}
+            actionable = {d for d in self._domain.values()}
             # The unexplained remainder COMPETES in the argmax. It owns no knob, so if it is the
             # largest share of the step the planner has nothing to move and declines -- which is
             # the correct response to "most of this step is something I cannot name". Actuation
@@ -1675,7 +1711,13 @@ class CoordinateBanditPlanner:
                     ranked = [(doms.get("input", 0.0), "input")] + [
                         r for r in ranked if r[1] != "input"]
 
-            if ranked and ranked[0][1] not in actionable:
+            # C2 ABLATION (`_always_act`): guards ONLY this decline, nothing past it. When it
+            # fires, `ranked[0]` may still name a domain with no owned knob, and the `owned = [...]`
+            # lookup a few lines down then comes back empty, so the window silently emits nothing
+            # -- same numeric outcome as a decline, but with no `decision="decline"
+            # reason="dominant share of the step is unattributed"` record. That absence, not a
+            # changed knob value, is the mechanism signature to check (T3-0 4s.56).
+            if ranked and ranked[0][1] not in actionable and not self._always_act:
                 _bw = self._node_read_bandwidth(obs)
                 logger.info(
                     "optimizer.cbandit.decision", window=completed, decision="decline",
@@ -1957,7 +1999,13 @@ class CoordinateBanditPlanner:
                         # is how all eight of 4s.23's spurious moves got in: every one of them was
                         # at window 530 of 539, where the record carries no horizon at all. Same
                         # discipline as the price, which declines a positive-cost move without one.
-                        verifiable = bool(vwhy.get("reachable", True)) and bool(rem_w)
+                        # C3 ABLATION (`_horizon_weight`): drop the `bool(rem_w)` half. A move at
+                        # or near the end of the run, with no windows left to repay it, is no
+                        # longer vetoed for that reason alone -- paired with the `gain_s` change in
+                        # `_pick`, this is what lets an unpriced-horizon controller relocate where
+                        # it cannot amortise.
+                        verifiable = bool(vwhy.get("reachable", True)) and (
+                            bool(rem_w) or not self._horizon_weight)
                         delta_last = {"delta": _rounded(delta), "source": delta_src,
                                       "n_required": vwhy.get("n_required"),
                                       "verifiable": verifiable}
