@@ -302,6 +302,39 @@ class Window:
         self._counter = 0
         return emitted
 
+    def discard(self) -> bool:
+        """Close an already-announced window that contained no completed step.
+
+        A loop may open a window immediately before ``next(loader)`` discovers
+        end-of-input.  Its start boundary is already visible to the streaming
+        tracker, so silently removing the close would corrupt the next window.
+        Emit a paired, explicitly non-actionable close instead.  This is not a
+        partial epoch flush: callers use it only after an unsuccessful fetch.
+        """
+        if not self._active:
+            return False
+        self._active = False
+        if self._dft is not None:
+            t = self._dft.get_time()
+            self._dft.enter_event()
+            self._dft.log_event(
+                name="window.stop",
+                cat="window",
+                start_time=t,
+                duration=0,
+                int_args={
+                    "window_index": _INT_TAG(self._window_index),
+                    "every_n": _INT_TAG(self._every_n),
+                    "counter": _INT_TAG(self._counter),
+                    "discard": _INT_TAG(1),
+                    **self._epoch_args(),
+                    **self._horizon_args(),
+                },
+            )
+            self._dft.exit_event()
+        self._counter = 0
+        return True
+
     def increase_cadence(self) -> None:
         """Double the cadence (called by optimizer when overhead is too high)."""
         new = self._every_n * 2

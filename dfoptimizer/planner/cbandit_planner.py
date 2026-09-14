@@ -530,6 +530,11 @@ class CoordinateBanditPlanner:
         # bug: reader_posix as the domain time instead of the exposed fetch. See
         # clbo_planner.domains_from_metrics.
         domains = domains_from_metrics(m)
+        # Explicit coherent provenance that fails validation is not equivalent to
+        # missing provenance.  Do not update bandit state, epoch aggregates, or
+        # emit a plan from an invalid vector.
+        if domains is None:
+            return None
         # THE PART OF THE STEP WE CANNOT NAME.
         #
         # The domain times above do not have to add up to the wall, and on DLIO they badly do not:
@@ -552,7 +557,15 @@ class CoordinateBanditPlanner:
         # the cadence when it is absent, which it is on some presets. Either way the accumulator
         # only needs a key that changes when the epoch does.
         wpe = _num_or_none(m.get("windows_per_epoch"))
+        # The native window fact is indexed by `window`, so it need not carry
+        # an event-level `epoch` field.  The boundary contract nevertheless
+        # forwards the workload's authoritative epoch as `epoch_index`.
+        # Prefer it before deriving an epoch from a global control-window
+        # counter: tails/flushes make that arithmetic disagree with the real
+        # workload epoch and prematurely reset cbandit's evidence.
         epoch_key = m.get("epoch")
+        if epoch_key is None:
+            epoch_key = m.get("epoch_index")
         if epoch_key is None and wpe:
             epoch_key = int(window // float(wpe))
         # THE FULL WINDOW INPUT, ON EVERY WINDOW INCLUDING A DECLINE.
@@ -571,9 +584,12 @@ class CoordinateBanditPlanner:
                     dest_read_gbs=self._dest_read_gbs or None,
                     stage_rate_gbs=self._stage_rate_gbs or None,
                     cfg=dict(self._planned_cfg.get(window, self._short_cfg())))
-        for _d, _v in domains.items():
-            self._epoch_dom.setdefault(_d, deque(maxlen=self._sample_window)).append(
-                float(_v or 0.0))
+        # Establish/reset the epoch before accepting this window's domain
+        # observation.  Appending first discarded the first observation of
+        # every real epoch when `_note_epoch()` noticed the transition below.
+        # That made the epoch-local evidence counter disagree with its sample
+        # arrays and, at short cadences, could make a valid controller decision
+        # impossible solely because of ordering.
         self._note_epoch(epoch_key, m.get("node_read_bytes", 0.0),
                          self._node_read_bandwidth({
                              "node_read_bytes": m.get("node_read_bytes", 0.0),
@@ -581,6 +597,9 @@ class CoordinateBanditPlanner:
                              "node_read_busy_s": m.get("node_read_busy_s", 0.0),
                              "wall": float(wall)}),
                          wall_s=float(wall))
+        for _d, _v in domains.items():
+            self._epoch_dom.setdefault(_d, deque(maxlen=self._sample_window)).append(
+                float(_v or 0.0))
         return {
             "cfg": dict(self._planned_cfg.get(window, self._short_cfg())),
             "domains": domains,

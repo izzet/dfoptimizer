@@ -21,6 +21,7 @@ Online mapping (per window):
     the offline optimize()/tests use. No domain-fraction threshold anywhere.
 """
 from __future__ import annotations
+import math
 import os
 import uuid
 from typing import Dict, List, Optional
@@ -57,7 +58,7 @@ def _domain_of(knob_short: str) -> str:
 
 
 
-def domains_from_metrics(m: Dict[str, float]) -> Dict[str, float]:
+def domains_from_metrics(m: Dict[str, float]) -> Optional[Dict[str, float]]:
     """Per-domain times for one window. THE single definition, shared by both planners.
 
     input = fetch - decode, NOT reader_posix. This is the documented decomposition
@@ -102,9 +103,38 @@ def domains_from_metrics(m: Dict[str, float]) -> Dict[str, float]:
     # right vector for pricing a knob: every other rank's comm is inflated by this rank's stall, so
     # relieving its input relieves their comm too. `domain_coherent` says whether the analyzer path
     # that produced this window could build it at all; when it could not, we fall back to the old
-    # metrics rather than pricing a vector we know does not close.
-    if float(m.get("domain_coherent", 0.0) or 0.0) >= 1.0 \
-            and "domain_input_time_proc_crit" in m:
+    # metrics rather than pricing a vector we know does not close.  Key presence
+    # distinguishes an old producer (which has no coherent provenance and may use
+    # the legacy path) from a producer that explicitly supplied an unusable
+    # coherent vector.  The latter must fail closed: attractive legacy metrics
+    # cannot authorize an action after the newer measurement path has said the
+    # window is invalid.
+    coherent_keys = (
+        "domain_input_time_proc_crit", "domain_decode_time_proc_crit",
+        "domain_comm_time_proc_crit", "domain_compute_time_proc_crit",
+    )
+    if "domain_coherent" in m:
+        marker = m.get("domain_coherent")
+        active = m.get("domain_procs_active")
+        wall = m.get("window_wall_time_proc_crit")
+        values = [m.get(key) for key in coherent_keys]
+        valid = (
+            isinstance(marker, (int, float)) and math.isfinite(float(marker)) and float(marker) == 1.0
+            and isinstance(active, (int, float)) and math.isfinite(float(active)) and float(active) >= 1.0
+            and isinstance(wall, (int, float)) and math.isfinite(float(wall)) and float(wall) > 0.0
+            and all(isinstance(value, (int, float)) and math.isfinite(float(value)) and float(value) >= 0.0
+                    for value in values)
+        )
+        if not valid:
+            m["domain_exposure_present"] = 0.0
+            m["domain_exposure_fallback"] = 0.0
+            m["domain_exposure_invalid"] = 1.0
+            logger.warning(
+                "optimizer.domains.coherent_invalid",
+                marker=marker, procs_active=active, wall=wall,
+                missing=[key for key, value in zip(coherent_keys, values) if value is None],
+            )
+            return None
         vec = {
             "input": float(m.get("domain_input_time_proc_crit", 0.0) or 0.0),
             "decode": float(m.get("domain_decode_time_proc_crit", 0.0) or 0.0),
@@ -113,6 +143,7 @@ def domains_from_metrics(m: Dict[str, float]) -> Dict[str, float]:
         }
         m["domain_exposure_present"] = 1.0
         m["domain_exposure_fallback"] = 0.0
+        m["domain_exposure_invalid"] = 0.0
         logger.info(
             "optimizer.domains.coherent",
             source="domain_*_time_proc_crit",
@@ -133,6 +164,7 @@ def domains_from_metrics(m: Dict[str, float]) -> Dict[str, float]:
     exposure_present = storage_exposure_key in m
     m["domain_exposure_present"] = float(exposure_present)
     m["domain_exposure_fallback"] = float(not exposure_present)
+    m["domain_exposure_invalid"] = 0.0
 
     if exposure_present:
         input_time = float(m.get(storage_exposure_key, 0.0) or 0.0)
@@ -243,9 +275,10 @@ class CLBOPlanner:
         if wall is None or wall <= 0:
             return None
         cfg = self._planned_cfg.get(window, self._default_short)
-        return {"cfg": dict(cfg),
-                "domains": domains_from_metrics(m),
-                "wall": float(wall)}
+        domains = domains_from_metrics(m)
+        if domains is None:
+            return None
+        return {"cfg": dict(cfg), "domains": domains, "wall": float(wall)}
 
     # --- Planner-compatible decision entry ---
     def process_finding(self, finding: DiagnosisFindingMsg) -> List[ActionPlan]:
