@@ -708,7 +708,8 @@ class Planner:
 
     def apply_ack(self, plan_id: str, knob_id: str, status: str,
                   old_value=None, new_value=None, window_index: int = -1,
-                  target_nodes: Optional[List[str]] = None, **_forward_compat):
+                  target_nodes: Optional[List[str]] = None,
+                  effective_window_id=None, **_forward_compat):
         """Process an ACK from the app.
 
         Clears the pending-plan gate for this knob and starts cooldown
@@ -787,10 +788,15 @@ class Planner:
                     self.current_values[knob_id] = new_value
             # Start cooldown from APPLICATION point, not publish point.
             # Record the severity at plan time for effectiveness comparison.
-            # Prefer the window the app reports it applied in; fall back to the window the
-            # plan was CREATED in when the ack does not carry one (it currently never does).
-            # Without the fallback this record never happens and the gates are inert.
-            _eff_window = window_index if window_index >= 0 else plan_window
+            # Prefer the native application window; old ACK producers have no
+            # such field and retain their historical window_index/plan-window
+            # fallback semantics.
+            try:
+                _native_window = int(effective_window_id)
+            except (TypeError, ValueError):
+                _native_window = -1
+            _eff_window = (_native_window if _native_window >= 0
+                           else window_index if window_index >= 0 else plan_window)
             if _eff_window >= 0 and plan_severity is not None:
                 self.cooldown.record(
                     knob_id, _eff_window,
@@ -802,7 +808,7 @@ class Planner:
                     knob_id=knob_id, node=node or "global",
                     window_index=_eff_window,
                     severity_at_action=round(float(plan_severity), 3),
-                    from_ack=bool(window_index >= 0),
+                    from_ack=bool(_native_window >= 0 or window_index >= 0),
                 )
         elif status == "rejected":
             # Revert current value — plan was not applied

@@ -3,6 +3,7 @@ import os
 import queue
 import socket
 import threading
+import time
 from collections import defaultdict
 from typing import Dict, List, Optional
 
@@ -210,7 +211,8 @@ class OptimizerContext:
         return self.drain_actions_for(func_name, at)
 
     def ack_action(self, plan: ActionPlan, old_value, new_value, status="applied",
-                   reason="", completed_at=None, effective_at=None):
+                   reason="", completed_at=None, effective_at=None,
+                   effective_window_id=None, applied_step=None, apply_cost_s=None):
         ack = ActionAck(
             plan_id=plan.plan_id,
             knob_id=plan.knob_id,
@@ -220,6 +222,12 @@ class OptimizerContext:
             reason=reason or "",
             completed_at=completed_at,
             effective_at=effective_at,
+            effective_window_id=effective_window_id,
+            applied_step=applied_step,
+            apply_cost_s=apply_cost_s,
+            host=os.environ.get("DLIO_MPI_HOSTNAME", socket.gethostname()),
+            global_rank=int(os.environ.get("DLIO_MPI_GLOBAL_RANK", os.environ.get("RANK", "-1")) or -1),
+            local_rank=int(os.environ.get("DLIO_MPI_LOCAL_RANK", os.environ.get("LOCAL_RANK", "-1")) or -1),
         )
         logger.info(
             "optimizer.action.ack",
@@ -231,6 +239,12 @@ class OptimizerContext:
             reason=reason or None,
             completed_at=completed_at,
             effective_at=effective_at,
+            effective_window_id=effective_window_id,
+            applied_step=applied_step,
+            apply_cost_s=apply_cost_s,
+            host=ack.host,
+            global_rank=ack.global_rank,
+            local_rank=ack.local_rank,
         )
         self._publish_ack(ack)
 
@@ -413,6 +427,11 @@ class OptimizerContext:
 
         logger.info(
             "optimizer.context.plan_received",
+            observed_step=getattr(self, "_application_step", None),
+            received_wall_ns=time.time_ns(),
+            received_monotonic_ns=time.monotonic_ns(),
+            host=socket.gethostname(),
+            global_rank=int(os.environ.get("RANK", "-1")),
             plan_id=plan.plan_id,
             knob_id=plan.knob_id,
             new_value=plan.new_value,

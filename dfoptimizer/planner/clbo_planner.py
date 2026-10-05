@@ -48,12 +48,25 @@ _DOMAIN_OF = {
     "data_source": "input",
     "transfer_size": "input",
     "halo_width": "comm",
+    # DELIVERY layer (worker -> trainer sample handoff). `delivery_mode` owns the delivery domain;
+    # the layout knobs (`transfer_mb`, `read_threads`) change HOW the same bytes are read, so they
+    # belong to the storage ("input") domain. All three are rank-local and math-neutral.
+    "delivery_mode": "delivery",
+    "transfer_mb": "input",
     "bucket_cap": "comm", "bucket_cap_mb": "comm", "reduce_bucket_size": "comm",
     "accumulate_grad_batches": "comm", "accum": "comm",
 }
 
 
 def _domain_of(knob_short: str) -> str:
+    # `computation_threads` is the TF decode map's num_parallel_calls.  DLIO's compute domain is a
+    # sleep, so it stays "compute" (actuator-less) unless the TF decode knob is explicitly
+    # registered; then it is priced in the INPUT domain, because the only measurable exposure of
+    # decode on DLIO/TF is the consumer wait (stall.storage) that contains it.  Which of
+    # read_threads / computation_threads helps is decided by the cbandit's verified effect.
+    if knob_short == "computation_threads" and os.environ.get(
+            "DFOPTIMIZER_REGISTER_COMPUTATION_THREADS", "0") == "1":
+        return "input"
     return _DOMAIN_OF.get(knob_short, "compute")
 
 
@@ -89,6 +102,20 @@ def domains_from_metrics(m: Dict[str, float]) -> Optional[Dict[str, float]]:
     that cost was doing and is kept for choosing WHICH knob to move inside the input domain -- it
     is a within-domain diagnostic, not a domain time.
     """
+    if m.get("liveflow_v1_attribution") == 1.0:
+        keys = {"input": "lf_v1_storage_wait", "decode": "lf_v1_decode_wait",
+                "comm": "lf_v1_comm_wait", "compute": "lf_v1_compute_time"}
+        # A producer that declares the delivery family carries its wait; a producer that does not
+        # (every older window, halo3d, DLIO) has no delivery domain at all. Never a default for a
+        # DECLARED family: a declared window without the measurement is invalid, not zero.
+        if m.get("lf_v1_delivery_declared") == 1.0:
+            keys["delivery"] = "lf_v1_delivery_wait"
+        values = {domain: m.get(key) for domain, key in keys.items()}
+        if not all(isinstance(v, (int, float)) and math.isfinite(v) and v >= 0
+                   for v in values.values()):
+            return None
+        return {domain: float(value) for domain, value in values.items()}
+
     # THE COHERENT VECTOR FIRST (2026-09-08, STATUS-ATTRIBUTION-FIX-2026-09-08.md).
     #
     # Everything below this block reads `<layer>_time_proc_max`, which is a maximum over processes
@@ -135,12 +162,111 @@ def domains_from_metrics(m: Dict[str, float]) -> Optional[Dict[str, float]]:
                 missing=[key for key, value in zip(coherent_keys, values) if value is None],
             )
             return None
+        # E1 (judge batch 4, sum-of-max, STORMER-LOOP-DESIGN sec 11/12/14): `domain_input_time_proc_crit`
+        # is a window max-of-SUM (one rank, chosen once, summed over the whole window); under a
+        # rotating straggler each rank's own window sum is roughly 1/R of the true critical-path cost,
+        # so it understates input exposure by up to a factor of R. `domain_input_step_max_sum_time`
+        # (attach_input_step_max_sum_metrics, a declared (window, step) view) is a SUM-of-max instead:
+        # per step, the max over ranks, summed over the window -- structurally correct for a rotating
+        # straggler and needs no comm events. But it is computed PER NODE AGENT (each node_agent sees
+        # only its own local ranks' fetch_iter rows), so it still understates the job's true
+        # `max over ALL ranks per step` under a rotating straggler that lands on other nodes (measured,
+        # tree-v4.3 smoke: 0.129 per-node pooled vs ~0.372 all-16-rank offline). `domain_input_job_step_
+        # max_sum_time` (sec 16, `attach_input_job_step_max_sum_metrics`) is the same sum-of-max but
+        # reduced CROSS-NODE via a rank-side `Iallreduce(MAX)`, opt-in and off by default -- prefer it
+        # whenever present and finite; else prefer the per-node sum-of-max whenever the window covered
+        # more than one distinct step; else fall back to the oldest `crit` value. Every rejected tier is
+        # still read and logged (`input_crit_reference`, `input_per_node_reference`), so each stays
+        # checkable as a regression reference, never silently dropped.
+        input_crit_reference = float(m.get("domain_input_time_proc_crit", 0.0) or 0.0)
+        step_sum_of_max = m.get("domain_input_step_max_sum_time")
+        step_nunique = m.get("domain_input_step_nunique")
+        use_step_sum_of_max = (
+            step_sum_of_max is not None and step_nunique is not None
+            and isinstance(step_sum_of_max, (int, float)) and math.isfinite(float(step_sum_of_max))
+            and isinstance(step_nunique, (int, float)) and math.isfinite(float(step_nunique))
+            and float(step_nunique) >= 2.0 and float(step_sum_of_max) >= 0.0
+        )
+        input_per_node_reference = float(step_sum_of_max) if use_step_sum_of_max else input_crit_reference
+        job_sum_of_max = m.get("domain_input_job_step_max_sum_time")
+        use_job_sum_of_max = (
+            job_sum_of_max is not None
+            and isinstance(job_sum_of_max, (int, float)) and math.isfinite(float(job_sum_of_max))
+            and float(job_sum_of_max) >= 0.0
+        )
+        if use_job_sum_of_max:
+            input_value, input_source = float(job_sum_of_max), "job_sum_of_max"
+        elif use_step_sum_of_max:
+            input_value, input_source = float(step_sum_of_max), "step_sum_of_max"
+        else:
+            input_value, input_source = input_crit_reference, "domain_input_time_proc_crit"
+
+        # E2 revision (STORMER-LOOP-DESIGN sec 17 v2, orchestrator decision 2026-09-27, full
+        # input+comm loop): `domain_comm_pure_exposure_time_v2` (attach_comm_exposed_median_metrics)
+        # is the window median of domain2's per-step exposed-comm event, times step count -- robust to
+        # the spike-dominated raw sums the B1 agreement check found. Prefer it whenever the window
+        # actually covered more than one distinct step (same suppression rule as the input side); else
+        # fall back to `domain_comm_time_proc_crit` unchanged. The rejected reference is always still
+        # read and logged for regression comparison.
+        comm_crit_reference = float(m.get("domain_comm_time_proc_crit", 0.0) or 0.0)
+        comm_exposed_v2 = m.get("domain_comm_pure_exposure_time_v2")
+        comm_exposure_nunique = m.get("domain_comm_exposure_step_nunique")
+        use_comm_exposed_v2 = (
+            comm_exposed_v2 is not None and comm_exposure_nunique is not None
+            and isinstance(comm_exposed_v2, (int, float)) and math.isfinite(float(comm_exposed_v2))
+            and isinstance(comm_exposure_nunique, (int, float))
+            and math.isfinite(float(comm_exposure_nunique))
+            and float(comm_exposure_nunique) >= 2.0 and float(comm_exposed_v2) >= 0.0
+        )
+        # sec 17 v3 (orchestrator decision 2026-09-27, opt-in `DFOPTIMIZER_COMM_EXPOSURE_SOURCE=total`,
+        # default "exposed" = unchanged behavior above). Domain2's exposed-comm validation found
+        # exposed comm tiny and HIGHER at cap400 (1.8ms cap25/W16 vs 7.6ms cap400/W16) while TOTAL comm
+        # was 173 vs 81ms -- Step 0c's cap400 gain looks like comm/compute INTERFERENCE (overlapped
+        # RCCL slows backward; fewer, larger buckets interfere less), not an exposed-tail effect.
+        # `domain_comm_total_median_time_v3` (attach_comm_total_median_metrics) is an UPPER BOUND on
+        # what a bucket_cap change can be worth (the whole comm cost that step, not just its
+        # non-overlapped tail) -- a PROPOSAL bound, not a guaranteed-real savings estimate. The bound
+        # only says a move is worth PROPOSING/verifying; JOINT_VERIFY's measured wall-time improvement
+        # (unmodified, existing mechanism) is the ARBITER that decides whether the move is kept (a
+        # jointly-worse configuration reverts LIFO, same as always). This flag changes ONLY which
+        # number feeds the argmax/predicted-effect stage; it adds no new acceptance mechanism.
+        comm_total_v3 = m.get("domain_comm_total_median_time_v3")
+        comm_total_nunique = m.get("domain_comm_total_step_nunique")
+        use_comm_total_v3 = (
+            os.environ.get("DFOPTIMIZER_COMM_EXPOSURE_SOURCE", "exposed") == "total"
+            and comm_total_v3 is not None and comm_total_nunique is not None
+            and isinstance(comm_total_v3, (int, float)) and math.isfinite(float(comm_total_v3))
+            and isinstance(comm_total_nunique, (int, float)) and math.isfinite(float(comm_total_nunique))
+            and float(comm_total_nunique) >= 2.0 and float(comm_total_v3) >= 0.0
+        )
+        if use_comm_total_v3:
+            comm_value, comm_source = float(comm_total_v3), "comm_total_median_v3"
+        elif use_comm_exposed_v2:
+            comm_value, comm_source = float(comm_exposed_v2), "comm_exposed_median_v2"
+        else:
+            comm_value, comm_source = comm_crit_reference, "domain_comm_time_proc_crit"
+
         vec = {
-            "input": float(m.get("domain_input_time_proc_crit", 0.0) or 0.0),
+            "input": input_value,
             "decode": float(m.get("domain_decode_time_proc_crit", 0.0) or 0.0),
-            "comm": float(m.get("domain_comm_time_proc_crit", 0.0) or 0.0),
+            "comm": comm_value,
             "compute": float(m.get("domain_compute_time_proc_crit", 0.0) or 0.0),
         }
+        logger.info(
+            "optimizer.domains.input_source",
+            source=input_source,
+            input_job_sum_of_max=job_sum_of_max,
+            input_step_sum_of_max=step_sum_of_max, input_step_nunique=step_nunique,
+            input_crit_reference=input_crit_reference,
+            input_per_node_reference=input_per_node_reference, input_used=input_value,
+        )
+        logger.info(
+            "optimizer.domains.comm_source",
+            source=comm_source,
+            comm_exposed_median_v2=comm_exposed_v2, comm_exposure_step_nunique=comm_exposure_nunique,
+            comm_total_median_v3=comm_total_v3, comm_total_step_nunique=comm_total_nunique,
+            comm_crit_reference=comm_crit_reference, comm_used=comm_value,
+        )
         m["domain_exposure_present"] = 1.0
         m["domain_exposure_fallback"] = 0.0
         m["domain_exposure_invalid"] = 0.0

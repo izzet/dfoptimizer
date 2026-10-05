@@ -15,7 +15,7 @@ import os
 import signal
 import threading
 import time
-from typing import Dict, List
+from typing import Dict, List, NamedTuple
 
 import structlog
 
@@ -26,6 +26,16 @@ from .runtime.knob import knob_def_from_dict, knob_def_from_wire
 from .planner.planner import Planner
 
 logger = structlog.get_logger()
+
+
+class ControlWindowCompletion(NamedTuple):
+    """A non-diagnostic native-window watermark from LiveDiagnoser."""
+
+    window_index: int
+
+
+class ControlStreamStop(NamedTuple):
+    """Ordered terminal marker forwarded by LiveDiagnoser."""
 
 
 def _make_planner():
@@ -80,6 +90,120 @@ class Optimizer:
         self._plans_produced = 0
         self._output_topic = ""
         self._plan_fanout = 1
+        # Separate from the process-wide SIGTERM flag: a clean input EOS stops the optimizer's
+        # helper consumers without changing signal disposition for its sibling agent stages.
+        self._stream_stop = threading.Event()
+        # Opt-in experiment controls.  An unset allowlist/cap keeps historical
+        # registration and planner behaviour unchanged; a present empty
+        # allowlist admits no actuator.
+        raw_allowed = os.environ.get("DFOPTIMIZER_ALLOWED_KNOBS")
+        self._allowed_knobs = (None if raw_allowed is None else frozenset(
+            knob.strip() for knob in raw_allowed.split(",") if knob.strip()
+        ))
+        raw_cap = os.environ.get("DFOPTIMIZER_ACTION_ACK_CAP")
+        try:
+            self._action_ack_cap = None if raw_cap is None else max(int(raw_cap), 0)
+        except ValueError:
+            # A malformed experiment setting must not silently make actions
+            # unlimited.  Zero is a fail-closed cap.
+            self._action_ack_cap = 0
+            logger.warning("optimizer.experiment_controls.invalid_ack_cap", value=raw_cap)
+        self._acknowledged_plan_ids = set()
+        self._reserved_plan_ids = set()
+        self._experiment_lock = threading.Lock()
+        # Opt-in collective acknowledgement semantics for a node-local plan.
+        # Ordinary deployments retain their historical one-ACK behaviour.
+        raw_expected_local_ranks = os.environ.get("DFOPTIMIZER_EXPECTED_LOCAL_RANKS")
+        try:
+            self._expected_local_ranks = (None if raw_expected_local_ranks is None
+                                          else max(1, int(raw_expected_local_ranks)))
+        except ValueError:
+            self._expected_local_ranks = 1
+            logger.warning("optimizer.acks.invalid_expected_local_ranks",
+                           value=raw_expected_local_ranks)
+        self._collective_ack_members = {}
+        self._collective_ack_completed = set()
+        self._collective_ack_failed = set()
+        self._collective_ack_failed_plans = set()
+        self._collective_ack_lock = threading.Lock()
+        logger.info(
+            "optimizer.experiment_controls",
+            allowed_knobs=(sorted(self._allowed_knobs)
+                           if self._allowed_knobs is not None else None),
+            acknowledged_action_cap=self._action_ack_cap,
+            expected_local_ranks=self._expected_local_ranks,
+        )
+
+    def _filter_experiment_knobs(self, knob_defs, current_values, *, source):
+        """Restrict an opt-in experiment to its declared actuator set."""
+        if self._allowed_knobs is None:
+            return knob_defs, current_values
+        kept = {kid: kd for kid, kd in knob_defs.items() if kid in self._allowed_knobs}
+        kept_values = {kid: value for kid, value in current_values.items() if kid in kept}
+        logger.info(
+            "optimizer.registry.filtered",
+            source=source,
+            allowed_knobs=sorted(self._allowed_knobs),
+            registered_knobs=sorted(kept),
+            excluded_knobs=sorted(set(knob_defs) - set(kept)),
+        )
+        return kept, kept_values
+
+    def _action_capacity_exhausted(self):
+        with self._experiment_lock:
+            return (self._action_ack_cap is not None
+                    and (len(self._acknowledged_plan_ids) + len(self._reserved_plan_ids)
+                         >= self._action_ack_cap))
+
+    def _reserve_experiment_plans(self, plans):
+        """Atomically reserve changed actions before they reach the application.
+
+        A cap on acknowledgements alone has a race: two control windows can
+        publish before the first application acknowledgement returns.  Pending
+        plans therefore consume capacity just like acknowledged changes, and a
+        non-applied acknowledgement releases its reservation.
+        """
+        if self._action_ack_cap is None:
+            return list(plans), []
+        accepted, suppressed = [], []
+        with self._experiment_lock:
+            for plan in plans:
+                changed = plan.old_value != plan.new_value
+                used = len(self._acknowledged_plan_ids) + len(self._reserved_plan_ids)
+                if changed and used >= self._action_ack_cap:
+                    suppressed.append(plan)
+                    continue
+                accepted.append(plan)
+                if changed:
+                    self._reserved_plan_ids.add(plan.plan_id)
+            logger.info(
+                "optimizer.experiment_controls.plan_reservation",
+                accepted_plan_ids=[plan.plan_id for plan in accepted],
+                suppressed_plan_ids=[plan.plan_id for plan in suppressed],
+                acknowledged_actions=len(self._acknowledged_plan_ids),
+                pending_actions=len(self._reserved_plan_ids),
+                acknowledged_action_cap=self._action_ack_cap,
+            )
+        return accepted, suppressed
+
+    def _record_acknowledged_action(self, *, plan_id, status, old_value, new_value):
+        """Record each changed plan once, despite per-rank acknowledgement fanout."""
+        if not plan_id:
+            return False
+        with self._experiment_lock:
+            self._reserved_plan_ids.discard(plan_id)
+            if status != "applied" or old_value == new_value:
+                return False
+            if plan_id in self._acknowledged_plan_ids:
+                return False
+            self._acknowledged_plan_ids.add(plan_id)
+            logger.info(
+                "optimizer.experiment_controls.action_acknowledged",
+                plan_id=plan_id,
+                acknowledged_actions=len(self._acknowledged_plan_ids),
+                acknowledged_action_cap=self._action_ack_cap,
+            )
+            return True
 
     def _maybe_bootstrap_knobs(self):
         if os.environ.get("DFOPTIMIZER_BOOTSTRAP_DLIO", "0") != "1":
@@ -262,6 +386,9 @@ class Optimizer:
         if "dlio.computation_threads" in knob_defs:
             current_values["dlio.computation_threads"] = int(
                 os.environ.get("DFOPTIMIZER_BOOTSTRAP_COMPUTATION_THREADS", "1"))
+        knob_defs, current_values = self._filter_experiment_knobs(
+            knob_defs, current_values, source="bootstrap"
+        )
         self.planner.register_knobs(knob_defs, current_values=current_values)
         logger.info(
             "optimizer.registry.bootstrapped",
@@ -335,6 +462,7 @@ class Optimizer:
     ):
         from .streaming.transport import open_consumer, open_producer
 
+        self._stream_stop.clear()
         self._output_topic = output_topic
         if output_topic == "global_plans":
             self._plan_fanout = max(
@@ -500,8 +628,27 @@ class Optimizer:
 
                     try:
                         finding = self._parse_finding(event)
-                        if finding is not None:
-                            plans = self.planner.process_finding(finding)
+                        if isinstance(finding, ControlStreamStop):
+                            ack_event(event)
+                            break
+                        if isinstance(finding, ControlWindowCompletion):
+                            complete = getattr(self.planner, "process_window_completion", None)
+                            plans = complete(finding.window_index) if complete else []
+                            self._publish_plans(producer, plans)
+                            plan_count += len(plans)
+                        elif finding is not None:
+                            if self._action_capacity_exhausted():
+                                logger.info(
+                                    "optimizer.experiment_controls.action_suppressed",
+                                    window=finding.window_index,
+                                    acknowledged_actions=len(self._acknowledged_plan_ids),
+                                    pending_actions=len(self._reserved_plan_ids),
+                                    acknowledged_action_cap=self._action_ack_cap,
+                                    reason="acknowledged_action_cap_reached",
+                                )
+                                plans = []
+                            else:
+                                plans = self.planner.process_finding(finding)
                             # ONE message for the whole window, not one per plan. See
                             # _publish_plans: the mailbox is a single slot and per-plan
                             # publishes overwrite each other.
@@ -518,6 +665,9 @@ class Optimizer:
                 logger.info("optimizer.stream.stop_signal", signal="SIGTERM")
 
         finally:
+            # Wake the registry/ack/global helper loops before joining them.  They do not receive
+            # the findings FIFO's EOS, and a clean stream end is not a process SIGTERM.
+            self._stream_stop.set()
             producer.flush()
             if registry_thread is not None:
                 registry_thread.join(timeout=wait_ms / 1000.0 + 1.0)
@@ -552,7 +702,7 @@ class Optimizer:
         logger.info("optimizer.registry.listening", topic=registry_topic)
         future = consumer.pull()
 
-        while not _shutdown_requested:
+        while not _shutdown_requested and not self._stream_stop.is_set():
             try:
                 event = future.wait(timeout_ms=1000)
             except Exception as ex:
@@ -582,7 +732,7 @@ class Optimizer:
         logger.info("optimizer.acks.listening")
         future = consumer.pull()
 
-        while not _shutdown_requested:
+        while not _shutdown_requested and not self._stream_stop.is_set():
             try:
                 event = future.wait(timeout_ms=1000)
             except Exception as ex:
@@ -599,18 +749,7 @@ class Optimizer:
                 if isinstance(payload, list):
                     payload = b"".join(payload)
                 msg = json.loads(payload.decode("utf-8"))
-                self.planner.apply_ack(
-                    plan_id=msg.get("plan_id", ""),
-                    knob_id=msg.get("knob_id", ""),
-                    status=msg.get("status", "unknown"),
-                    old_value=msg.get("old_value"),
-                    new_value=msg.get("new_value"),
-                    window_index=msg.get("window_index", -1),
-                    target_nodes=msg.get("target_nodes"),
-                    reason=msg.get("reason") or "",
-                    completed_at=msg.get("completed_at"),
-                    effective_at=msg.get("effective_at"),
-                )
+                self._handle_ack_message(msg)
             except Exception:
                 logger.exception("optimizer.acks.error")
 
@@ -621,6 +760,111 @@ class Optimizer:
             logger.info("optimizer.acks.stop_signal", signal="SIGTERM")
         del consumer
 
+    @staticmethod
+    def _ack_value_key(value):
+        """Stable key even if a future knob's value is structured."""
+        return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+
+    def _retain_ack_receipt(self, msg):
+        """Persist raw app receipts before collective aggregation when requested."""
+        path = os.environ.get("DFOPTIMIZER_ACK_LEDGER", "").strip()
+        if not path:
+            return
+        record = dict(msg)
+        record["receipt_kind"] = "raw_action_ack"
+        try:
+            with open(path, "a", encoding="utf-8") as receipt_file:
+                receipt_file.write(json.dumps(record, sort_keys=True) + "\n")
+        except Exception:
+            logger.exception("optimizer.acks.receipt_write_failed", path=path)
+
+    def _forward_ack_to_planner(self, msg):
+        self.planner.apply_ack(
+            plan_id=msg.get("plan_id", ""), knob_id=msg.get("knob_id", ""),
+            status=msg.get("status", "unknown"), old_value=msg.get("old_value"),
+            new_value=msg.get("new_value"), window_index=msg.get("window_index", -1),
+            target_nodes=msg.get("target_nodes"), reason=msg.get("reason") or "",
+            completed_at=msg.get("completed_at"), effective_at=msg.get("effective_at"),
+            effective_window_id=msg.get("effective_window_id"),
+            applied_step=msg.get("applied_step"),
+            apply_cost_s=msg.get("apply_cost_s"),
+        )
+        self._record_acknowledged_action(
+            plan_id=msg.get("plan_id", ""), status=msg.get("status", "unknown"),
+            old_value=msg.get("old_value"), new_value=msg.get("new_value"),
+        )
+
+    def _handle_ack_message(self, msg):
+        """Aggregate P2's rank-local reconciliations into one node action.
+
+        A partial, duplicate, malformed, or non-applied receipt is retained but
+        cannot advance the planner or release the logical action's reservation.
+        """
+        self._retain_ack_receipt(msg)
+        logger.info("optimizer.acks.receipt", received_wall_ns=time.time_ns(), plan_id=msg.get("plan_id", ""),
+                    knob_id=msg.get("knob_id", ""), status=msg.get("status", "unknown"),
+                    host=msg.get("host", ""), global_rank=msg.get("global_rank", -1),
+                    local_rank=msg.get("local_rank", -1), old_value=msg.get("old_value"),
+                    new_value=msg.get("new_value"))
+        expected = self._expected_local_ranks
+        if expected is None:
+            self._forward_ack_to_planner(msg)
+            return
+        host = str(msg.get("host") or "")
+        try:
+            local_rank = int(msg.get("local_rank", -1))
+            global_rank = int(msg.get("global_rank", -1))
+        except (TypeError, ValueError):
+            local_rank = global_rank = -1
+        plan_key = (str(msg.get("plan_id") or ""), str(msg.get("knob_id") or ""))
+        if not host or global_rank < 0 or local_rank < 0 or local_rank >= expected:
+            # One node agent owns one node's ACK stream.  A malformed receipt
+            # therefore makes this local logical plan untrustworthy even if a
+            # later receipt supplies a well-formed host/rank tuple.
+            self._collective_ack_failed_plans.add(plan_key)
+            logger.warning("optimizer.acks.collective_rejected", plan_id=msg.get("plan_id", ""),
+                           host=host, local_rank=local_rank, global_rank=global_rank,
+                           status=msg.get("status", "unknown"))
+            return
+        key = (host, str(msg.get("plan_id") or ""), str(msg.get("knob_id") or ""))
+        signature = (msg.get("status"), self._ack_value_key(msg.get("old_value")),
+                     self._ack_value_key(msg.get("new_value")),
+                     self._ack_value_key(msg.get("effective_window_id")),
+                     self._ack_value_key(msg.get("applied_step")))
+        with self._collective_ack_lock:
+            if (key in self._collective_ack_completed or key in self._collective_ack_failed
+                    or plan_key in self._collective_ack_failed_plans):
+                logger.warning("optimizer.acks.collective_duplicate_complete", plan_id=key[1],
+                               host=host, local_rank=local_rank)
+                return
+            group = self._collective_ack_members.setdefault(
+                key, {"signature": signature, "members": {}, "global_ranks": set()})
+            if (group["signature"] != signature or local_rank in group["members"]
+                    or global_rank in group["global_ranks"]):
+                self._collective_ack_failed.add(key)
+                self._collective_ack_failed_plans.add(plan_key)
+                del self._collective_ack_members[key]
+                logger.warning("optimizer.acks.collective_inconsistent", plan_id=key[1],
+                               host=host, local_rank=local_rank, global_rank=global_rank)
+                return
+            if msg.get("status") != "applied":
+                self._collective_ack_failed.add(key)
+                self._collective_ack_failed_plans.add(plan_key)
+                del self._collective_ack_members[key]
+                logger.warning("optimizer.acks.collective_non_applied", plan_id=key[1],
+                               host=host, local_rank=local_rank, status=msg.get("status"))
+                return
+            group["members"][local_rank] = msg
+            group["global_ranks"].add(global_rank)
+            if set(group["members"]) != set(range(expected)):
+                return
+            representative = group["members"][0]
+            self._collective_ack_completed.add(key)
+            del self._collective_ack_members[key]
+        logger.info("optimizer.acks.collective_complete", plan_id=key[1], knob_id=key[2],
+                    host=host, local_ranks=list(range(expected)))
+        self._forward_ack_to_planner(representative)
+
     def _global_plans_loop(self, consumer, local_producer):
         """Background thread: receive global plans, validate via planner, publish locally."""
         import socket
@@ -630,7 +874,7 @@ class Optimizer:
         accepted_count = 0
         skipped_count = 0
 
-        while not _shutdown_requested:
+        while not _shutdown_requested and not self._stream_stop.is_set():
             try:
                 event = self._wait_for_event(future, 1000)
             except Exception as ex:
@@ -699,9 +943,12 @@ class Optimizer:
             current_values=current_values,
         )
 
+        knob_defs, current_values = self._filter_experiment_knobs(
+            knob_defs, current_values, source="application"
+        )
         self.planner.register_knobs(knob_defs, current_values=current_values)
 
-    def _parse_finding(self, event) -> DiagnosisFindingMsg | None:
+    def _parse_finding(self, event) -> DiagnosisFindingMsg | ControlWindowCompletion | None:
         raw_metadata = event.metadata if hasattr(event, "metadata") else None
         if isinstance(raw_metadata, dict):
             metadata = raw_metadata
@@ -713,10 +960,19 @@ class Optimizer:
         else:
             metadata = {}
 
-        # Check for stop sentinel
+        # The liveflow node agent forwards the established terminal marker only after all
+        # diagnoser findings.  Return a distinct value so the run loop can ACK and break rather
+        # than treating EOS as an empty finding and polling forever.
         if metadata.get("name") == "end" or metadata.get("type") == "stop":
             logger.info("optimizer.stream.stop_sentinel")
-            return None
+            return ControlStreamStop()
+
+        if metadata.get("type") == "control_window_complete":
+            try:
+                return ControlWindowCompletion(int(metadata["window_index"]))
+            except (KeyError, TypeError, ValueError):
+                logger.warning("optimizer.window_completion.invalid_native_window")
+                return None
 
         payload = event.data
         if payload is None:
@@ -769,7 +1025,27 @@ class Optimizer:
         plans ARE: state, not events. The receiver keys them per knob (context._queues), so
         latest-wins is preserved exactly as before.
         """
-        plans = list(plans)
+        plans, suppressed = self._reserve_experiment_plans(list(plans))
+        # A planner stages its proposed value before publication.  If a
+        # concurrent acknowledgement used the final reservation between
+        # planning and this point, restore each suppressed proposal so the
+        # next admissible window observes the application's actual state.
+        for plan in suppressed:
+            self.planner.apply_ack(
+                plan_id=plan.plan_id,
+                knob_id=plan.knob_id,
+                status="rejected",
+                old_value=plan.old_value,
+                new_value=plan.new_value,
+                window_index=plan.window_index,
+                reason="experiment_action_cap",
+            )
+            logger.info(
+                "optimizer.experiment_controls.plan_suppressed",
+                plan_id=plan.plan_id,
+                knob_id=plan.knob_id,
+                reason="acknowledged_action_cap_reached",
+            )
         if not plans:
             return
         payload = json.dumps(
@@ -799,6 +1075,8 @@ class Optimizer:
     def _log_published(self, plan: ActionPlan):
         logger.info(
             "optimizer.plan.published",
+            published_wall_ns=time.time_ns(),
+            window_index=plan.window_index,
             plan_id=plan.plan_id,
             knob_id=plan.knob_id,
             old_value=plan.old_value,

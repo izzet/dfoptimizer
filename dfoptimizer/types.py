@@ -214,6 +214,18 @@ class ActionAck:
     # rebuilt, so the two instants are an epoch apart and every window between them measures the
     # OLD source. Carried on a second ack sent from the rebuild.
     effective_at: Any = None
+    # Native control-window identity at which the actuator became effective.
+    # Optional for compatibility with existing application ACK producers.
+    effective_window_id: Optional[int] = None
+    applied_step: Optional[int] = None
+    # Measured wall seconds training was held by this apply (worst rank, from the application's own
+    # clock). The planner prices a later change of the same knob from it. None = not measured.
+    apply_cost_s: Optional[float] = None
+    # A node-local SHM plan is reconciled by every rank on that node.  These
+    # fields make the raw, per-rank completion evidence explicit on the wire.
+    host: str = ""
+    global_rank: int = -1
+    local_rank: int = -1
 
 
 @dc.dataclass

@@ -11,7 +11,8 @@ import pytest
 
 from dfoptimizer.planner.cbandit_planner import CoordinateBanditPlanner
 from dfoptimizer.planner.clbo_planner import CLBOPlanner, domains_from_metrics
-from dfoptimizer.types import DiagnosisFindingMsg, KnobDef
+from dfoptimizer.optimizer import Optimizer
+from dfoptimizer.types import ActionPlan, DiagnosisFindingMsg, KnobDef
 
 
 def _knobs():
@@ -150,6 +151,19 @@ def test_legacy_metrics_without_domain_coherent_keep_exposure_fallback():
     assert metrics["domain_exposure_fallback"] == 1.0
 
 
+def test_cbandit_uses_the_authoritative_coherent_wall_when_legacy_wall_is_absent():
+    planner = CoordinateBanditPlanner()
+    planner.register_knobs(_knobs())
+    metrics = _valid_coherent_metrics()
+    metrics.pop("active_time")
+    planner._win_metrics = metrics
+
+    observation = planner._finalize_window(4)
+
+    assert observation is not None
+    assert observation["wall"] == metrics["window_wall_time_proc_crit"]
+
+
 @pytest.mark.parametrize("field,value", [
     ("domain_coherent", 0.0), ("domain_coherent", 2.0),
     ("domain_coherent", math.nan),
@@ -206,3 +220,57 @@ def test_valid_invalid_valid_sequence_does_not_carry_invalid_learning(planner_ty
         assert len(recovered["walls"]) == len(after_valid["walls"]) + 1
     else:
         assert recovered["total_pulls"] == after_valid["total_pulls"] + 1
+
+
+def test_experiment_allowlist_and_ack_cap_are_opt_in_and_fail_closed(monkeypatch):
+    monkeypatch.setenv("DFOPTIMIZER_ALLOWED_KNOBS", "dlio.read_threads")
+    monkeypatch.setenv("DFOPTIMIZER_ACTION_ACK_CAP", "1")
+    optimizer = Optimizer()
+    read = KnobDef(id="dlio.read_threads", default=1, type=int, range=(1, 4))
+    prefetch = KnobDef(id="dlio.prefetch_size", default=2, type=int, range=(1, 8))
+
+    kept, values = optimizer._filter_experiment_knobs(
+        {read.id: read, prefetch.id: prefetch},
+        {read.id: 1, prefetch.id: 2},
+        source="test",
+    )
+    assert set(kept) == {"dlio.read_threads"}
+    assert values == {"dlio.read_threads": 1}
+    assert not optimizer._action_capacity_exhausted()
+    first = ActionPlan(
+        plan_id="plan-1", knob_id="dlio.read_threads", old_value=1, new_value=2,
+        target_function="make_loader", apply_when="window_boundary", rationale="test",
+        finding_type="test", severity=1.0, opportunity_tag="reader_parallelism", window_index=1,
+    )
+    second = ActionPlan(
+        plan_id="plan-2", knob_id="dlio.read_threads", old_value=2, new_value=3,
+        target_function="make_loader", apply_when="window_boundary", rationale="test",
+        finding_type="test", severity=1.0, opportunity_tag="reader_parallelism", window_index=2,
+    )
+    admitted, suppressed = optimizer._reserve_experiment_plans([first])
+    assert admitted == [first] and suppressed == []
+    # A second eligible control window before the first ack cannot publish a
+    # second change, which is the experiment's one-action safety boundary.
+    admitted, suppressed = optimizer._reserve_experiment_plans([second])
+    assert admitted == [] and suppressed == [second]
+    assert optimizer._action_capacity_exhausted()
+    assert optimizer._record_acknowledged_action(
+        plan_id="plan-1", status="applied", old_value=1, new_value=2
+    )
+    assert optimizer._action_capacity_exhausted()
+    # Every rank may acknowledge the same plan, but it is only one change.
+    assert not optimizer._record_acknowledged_action(
+        plan_id="plan-1", status="applied", old_value=1, new_value=2
+    )
+
+    # A declined pending plan releases its reservation rather than consuming a
+    # change that the workload never accepted.
+    monkeypatch.setenv("DFOPTIMIZER_ACTION_ACK_CAP", "1")
+    released = Optimizer()
+    admitted, _ = released._reserve_experiment_plans([first])
+    assert admitted == [first]
+    assert not released._record_acknowledged_action(
+        plan_id="plan-1", status="rejected", old_value=1, new_value=2
+    )
+    admitted, suppressed = released._reserve_experiment_plans([second])
+    assert admitted == [second] and suppressed == []

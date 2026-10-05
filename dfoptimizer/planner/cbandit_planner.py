@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import math
 import random
+import dataclasses as _dc
 import time as _time
 import statistics
 import os
@@ -92,9 +93,32 @@ class CoordinateBanditPlanner:
         # matters under drift, and because an unbounded history would let a stale regime outvote
         # the current one.
         self._samples: Dict[Tuple[str, object], Deque[float]] = {}
+        # (window, whole configuration, wall) per recorded window: samples keyed by CONFIGURATION, for the
+        # joint verification (an arm keyed by one knob's value mixes every configuration that value ran in).
+        self._series: Deque = deque(maxlen=4096)
         self._cur_window: int = -1
         self._win_metrics: Dict[str, float] = {}
+        # A watermark is allowed to finalize only a real finding.  Retaining
+        # that finding preserves the existing decision/provenance path while
+        # making an empty native window incapable of creating a decision.
+        self._pending_finding: Optional[DiagnosisFindingMsg] = None
         self._planned_cfg: Dict[int, dict] = {}
+        # TAIL METRIC (same per-step family as the wall): the window's 90th-percentile per-step wall,
+        # seconds, keyed like `_samples` so an arm's tail can be tested the way its mean is.
+        self._tail_samples: Dict[Tuple[str, object], Deque[float]] = {}
+        self._credit_tail: Dict[int, float] = {}
+        # MEASURED APPLY COSTS, per knob: (|value change|, seconds training was held) of each applied
+        # change, reported by the application on its ACK. A later move is priced from the latest one.
+        self._apply_costs: Dict[str, List[Tuple[float, float]]] = {}
+        self._physical_seen = False
+        self._physical_change_old: Dict[Tuple[str, int], object] = {}
+        self._cost_by_step: Dict[int, float] = {}
+        self._cost_step_ids: Dict[str, int] = {}
+        self._observed_initial_cfg = None
+        self._applied_changes = []
+        self._physical_latest_cfg = None
+        self._physical_changes = []
+        self._observation_first_steps = {}
         self._total_pulls = 0
         # UCB exploration weight. Scales the confidence radius; 0 makes this pure greedy descent.
         self._c = float(os.environ.get("DFOPTIMIZER_CBANDIT_C", "0.35"))
@@ -131,6 +155,7 @@ class CoordinateBanditPlanner:
                                              str(self._min_samples)))
         self._last_move_window: Dict[str, int] = {}
         self._sample_window = int(os.environ.get("DFOPTIMIZER_CBANDIT_SAMPLE_WINDOW", "32"))
+        self._credit_observations = deque(maxlen=self._sample_window)
         # Set to 0 to disable the gate entirely and recover the previous behaviour exactly.
         self._accept_enabled = os.environ.get("DFOPTIMIZER_CBANDIT_ACCEPT", "1") != "0"
         # Cheapest-first escalation within the dominant domain. 0 restores the previous rule (one
@@ -152,6 +177,56 @@ class CoordinateBanditPlanner:
         # disables a different mechanism (the Welch/effect-floor acceptance test) and would leave
         # the ownership decline fully intact. Default 0 = today's behaviour exactly.
         self._always_act = os.environ.get("DFOPTIMIZER_CBANDIT_ALWAYS_ACT", "0") == "1"
+        # A1 (judge batch 1, 2026-09-25). The comm->input "barrier attribution" redirect lets a
+        # comm-dominant window act on storage knobs.  Default 1 = historical behaviour; the TF loop
+        # arm sets 0 so an input action can only come from an input-dominant window.  Every
+        # decision record carries `decision_path` so the path that produced it is auditable.
+        self._barrier_redirect = os.environ.get("DFOPTIMIZER_CBANDIT_BARRIER_REDIRECT", "1") != "0"
+        # A2. Default 0 = historical.  1 = (a) no candidate below the value the knob was registered
+        # with (the shipped Original) unless the measured explore_over_provisioned capacity path
+        # admits it, and (b) exploration needs a directional prediction: a best candidate that
+        # exactly ties another candidate on score is "no prediction" and the knob stays.
+        # `_unconfirmed_move` (revert of a move that fails its predicted-effect check) is kept
+        # and is the bounded regression budget.
+        self._strict_explore = os.environ.get("DFOPTIMIZER_CBANDIT_STRICT_EXPLORE", "0") == "1"
+        # The MEASURED replacement for the barrier redirect (SKEW-ATTRIBUTION-2026-09-25.md).  When the
+        # analyzer reports domain_skew_coverage == 1 and A = domain_input_skew_attributed_time > 0,
+        # the typical rank's vector is re-expressed as input' = input_typ + A, comm' = comm_typ - A
+        # (A <= W <= comm) and dominance/predicted effect are computed on that.  A == 0 or coverage 0
+        # => nothing moves.  Default ON; independent of the heuristic redirect above.
+        self._skew_link = os.environ.get("DFOPTIMIZER_CBANDIT_SKEW_LINK", "1") != "0"
+        # ACTIONABLE-DOMAIN PRIORITIZATION (orchestrator 2026-09-25).  Default 0 = historical: the
+        # dominant domain alone decides, and a dominant domain that owns no knob declines the window.
+        # 1: a dominant domain that owns no knob never vetoes.  Candidates are the domains that own a
+        # registered knob AND carry measured exposure > 0 in this window (the window only reaches the
+        # planner when the wired rule's fact fired); they are ranked by that measured exposure
+        # (direct input wait, plus the analyzer's skew-attributed A when coverage == 1, already folded
+        # into `domains` by the skew link).  No constant; every downstream gate is unchanged.
+        self._joint_verify = os.environ.get("DFOPTIMIZER_CBANDIT_JOINT_VERIFY", "0") == "1"
+        # COMM NEEDS MEASURED SKEW COVERAGE (opt-in; STORMER-LOOP-DESIGN sec 4).  A comm-domain action is
+        # admissible only in a window whose cross-rank skew attribution was measured (domain_skew_coverage == 1;
+        # A == 0 with coverage 1 is a real "no attributable skew").  Without coverage the barrier wait cannot be
+        # split into transfer and late-rank input, so comm is not credited and owns nothing that window.
+        self._comm_needs_skew = os.environ.get("DFOPTIMIZER_CBANDIT_COMM_NEEDS_SKEW", "0") == "1"
+        self._actionable_priority = os.environ.get(
+            "DFOPTIMIZER_CBANDIT_ACTIONABLE_PRIORITY", "0") == "1"
+        # E2 (judge batch 4): B2 (`wall - sum-of-max fetch`, comm probe OFF) bundles compute and comm
+        # into one unattributed "other" bucket, which has no owned knob.  Left in the ordinary argmax,
+        # "other" usually outweighs "input" (compute alone is often ~180 of a ~300ms step) and the
+        # window declines every time -- input never gets a turn even when its own exposure is real and
+        # actionable.  This flag makes "input" gate on ITS OWN measured exposure (present, finite,
+        # positive) plus the ordinary predicted-effect/verifiability checks that already run after
+        # `dom` is chosen, and "other" NEVER competes in an argmax for this decision.  It is a
+        # comm-observation-free (B2) mode: no bucket_cap_mb action can ever be reached this way,
+        # by construction (see B1's own separate requirement, STORMER-LOOP-DESIGN sec 13).
+        self._b2_input_only = os.environ.get(
+            "DFOPTIMIZER_CBANDIT_B2_INPUT_ONLY", "0") == "1"
+        # Sec 17 (full input+comm loop, orchestrator decision 2026-09-27): "a cap move can remove at
+        # most the exposed comm" -- see predicted_effect's own docstring for the exact clamp.
+        self._comm_effect_cap_window = os.environ.get(
+            "DFOPTIMIZER_CBANDIT_COMM_EFFECT_CAP_WINDOW", "0") == "1"
+        self._shipped = {}
+        self._last_pick_note = None
         # C3 ABLATION: prices a relocation's gain WITHOUT weighing it against the run remaining.
         # Cost weighting (`DFOPTIMIZER_CBANDIT_COST_W`) is untouched -- this only removes the two
         # horizon terms: `_pick`'s `gain_s = gain_per_window_s * remaining` and the outer
@@ -217,6 +292,8 @@ class CoordinateBanditPlanner:
         # observation: the mean bytes this node read per window, over the windows of the current
         # epoch seen so far. More samples, no new constant. The floor on how many windows is
         # `min_samples`, already the planner's threshold for calling an arm characterised.
+        self._rate_mode = False
+        self._control_steps = 1
         self._epoch_key: Optional[object] = None
         self._epoch_bytes: float = 0.0
         self._epoch_windows: int = 0
@@ -298,6 +375,17 @@ class CoordinateBanditPlanner:
         # would act in; the median says what a typical window holds. The decision's own expected
         # value for this cell is the median, and the two give opposite admissions (4s.23).
         self._epoch_dom: Dict[str, Deque[float]] = {}
+        # Window walls aligned with _epoch_dom, so a measurement taken over the recent exposed run can be
+        # tested against the wall noise OF THAT RUN (see _recent_run_effect / required_dwell).
+        self._epoch_wall_hist: Deque[float] = deque(maxlen=self._sample_window)
+        self._epoch_tail_hist: Deque[float] = deque(maxlen=self._sample_window)
+        self._move_base_tails: Dict[str, List[float]] = {}
+        self._recent_run_n = 0
+        # Pre-move walls of the regime a recent-run move was predicted in; the verification baseline for it.
+        self._move_base_walls: Dict[str, List[float]] = {}
+        # After a physically observed DECREASE (a revert) the next raise of that pool is one refinement
+        # step (+1), not x2; cleared by the next observed raise.
+        self._refine: Dict[str, bool] = {}
         # What a move predicted, so it can be reverted if it is not confirmed at that size.
         self._move_from: Dict[str, tuple] = {}
         # A RELOCATED ARM IS SAMPLED FROM THE ACTUATOR'S COMPLETION, NOT FROM THE PLAN (4s.31).
@@ -327,12 +415,27 @@ class CoordinateBanditPlanner:
         current_values = current_values or {}
         items = knob_defs.items() if hasattr(knob_defs, "items") else ((kd.id, kd) for kd in knob_defs)
         for knob_id, kd in items:
+            if os.environ.get("LIVEFLOW_PRESET") == "liveflow-v1" and knob_id.split('.')[-1] not in (
+                    'read_threads', 'decode_threads', 'num_workers', 'prefetch_factor',
+                    'prefetch_size', 'computation_threads', 'bucket_cap_mb', 'data_source',
+                    'transfer_mb', 'delivery_mode'):
+                logger.info('optimizer.liveflow_v1.knob_excluded', knob_id=knob_id,
+                            reason='not in the math-preserving v1 knob whitelist')
+                continue
             self.knobs[knob_id] = kd
             short = knob_id.split(".")[-1]
             self._short[knob_id] = short
             self._target_fn[knob_id] = kd.target_function
             cur = current_values.get(knob_id, kd.default)
             self.current_values[knob_id] = cur
+            # The FIRST registered value is the shipped/Original start; later merges never move it.
+            # The optimizer registers an env bootstrap registry BEFORE the application's own (which carries
+            # the workload's real starting value), so the shipped value is re-latched until the first
+            # finding arrives and never moves afterwards.
+            if self._cur_window == -1:
+                self._shipped[short] = cur
+            else:
+                self._shipped.setdefault(short, cur)
             self._domain[short] = _domain_of(short)
             self._levels[short] = _levels_for(kd, cur)
             # register_knobs MERGES and is called more than once (the optimizer bootstraps a
@@ -362,7 +465,8 @@ class CoordinateBanditPlanner:
     def apply_ack(self, plan_id: str = "", knob_id: str = "", status: str = "unknown",
                   old_value=None, new_value=None, window_index: int = -1,
                   target_nodes=None, reason: str = "", completed_at=None,
-                  effective_at=None):
+                  effective_at=None, effective_window_id=None, applied_step=None,
+                  apply_cost_s=None):
         """Process an ack from the application.
 
         THE BUG THIS FIXES, and it was loud in the log while being invisible in the results.
@@ -387,10 +491,18 @@ class CoordinateBanditPlanner:
         logger.info("optimizer.cbandit.ack", plan_id=plan_id, knob_id=knob_id, status=status,
                     old_value=old_value, new_value=new_value, window_index=window_index,
                     reason=reason or None, completed_at=completed_at,
-                    effective_at=effective_at)
+                    effective_at=effective_at, effective_window_id=effective_window_id)
         if knob_id not in self.knobs:
             return
         short_id = self._short.get(knob_id, knob_id)
+        self._note_apply_cost(short_id, status, old_value, new_value, apply_cost_s)
+        # The application may report the native boundary where the value actually
+        # took effect.  It is more precise than the optimizer's receipt window;
+        # malformed and absent values deliberately retain the legacy path.
+        try:
+            _ack_effective_window = int(effective_window_id)
+        except (TypeError, ValueError):
+            _ack_effective_window = -1
         # THE SECOND ACK: the actuator says the new source is IN USE (4s.37). It arrives at the
         # loader rebuild, a later call than the one that copied, so it is its own ack rather than a
         # field of the first. It reports no move -- the move already happened -- so it is handled
@@ -421,11 +533,8 @@ class CoordinateBanditPlanner:
             # window the plan was issued in.
             # USE THE TIMESTAMP THE ACTUATOR SENT, NOT A WINDOW INDEX (T3-0 4s.35).
             #
-            # `ActionAck` carries no window index at all, so this falls through to `_cur_window`.
-            # THAT FALLBACK WAS NOT THE FREEZE E DEFECT, and the claim that it was is retracted
-            # (T3-0 4s.36): windows do not advance during the copy, so the window the ack is
-            # processed in IS the first window after it, on r1e and r1f alike. The index is kept
-            # only as the last resort when no timestamp is on the wire.
+            # When the application supplies its native effective boundary, use it.  Older ACKs
+            # retain the historical receipt-window/current-window fallback.
             #
             # `completed_at` is the moment the copy returned. Windows that finished before it
             # contain the copy and belong to neither regime, so they are credited to neither.
@@ -436,7 +545,9 @@ class CoordinateBanditPlanner:
             # PENDING, and a pending move is neither confirmed nor reverted.
             self._reloc_live_at[short_id] = (float(completed_at)
                                              if completed_at is not None else None)
-            live = window_index if window_index is not None and window_index >= 0 else self._cur_window
+            live = (_ack_effective_window if _ack_effective_window >= 0 else
+                    window_index if window_index is not None and window_index >= 0 else
+                    self._cur_window)
             self._reloc_live_from[short_id] = int(live)
             self._reloc_pending.pop(short_id, None)
             self._reloc_published.pop(short_id, None)
@@ -445,18 +556,41 @@ class CoordinateBanditPlanner:
                         live_from_window=int(live), completed_at=completed_at,
                         effective_at=effective_at)
         if status == "applied":
+            if self._physical_latest_cfg is not None:
+                return  # ACK is a receipt; physical window state owns v1 credit/current state
             if new_value is not None:
+                if self._observed_initial_cfg is None:
+                    self._observed_initial_cfg = self._short_cfg()
+                if old_value is not None and not any(c[0] == short_id for c in self._applied_changes):
+                    self._observed_initial_cfg[short_id] = old_value
+                if _ack_effective_window >= 0 or applied_step is not None:
+                    self._applied_changes.append((short_id, new_value, _ack_effective_window,
+                                                  int(applied_step) if applied_step is not None else None))
                 applied = self.knobs[knob_id].clamp(new_value)
                 changed = applied != self.current_values.get(knob_id)
+                if changed:
+                    # D1d: the planner adopts the ACKED observed value as its arm.  The plan and the observation
+                    # differ only if the application applied something else (cross-node reconciliation); record it
+                    # and repair the window plan so samples are never labelled with an arm that never ran.
+                    _short = self._short.get(knob_id, knob_id)
+                    logger.info("optimizer.cbandit.consensus_override", knob_id=knob_id,
+                                planned=self.current_values.get(knob_id), observed=applied,
+                                window=self._cur_window)
+                    for _wk in [k for k in self._planned_cfg if k > self._cur_window]:
+                        self._planned_cfg[_wk][_short] = applied
                 self.current_values[knob_id] = applied
                 if changed and self._short.get(knob_id, knob_id) in self._regime_knobs:
-                    self._reset_other_arms(self._short.get(knob_id, knob_id), window_index)
+                    self._reset_other_arms(
+                        self._short.get(knob_id, knob_id),
+                        _ack_effective_window if _ack_effective_window >= 0 else window_index,
+                    )
             return
         # rejected / failed / anything else: the application is still on the old value, and our
         # model has to say so or the arm is lost for the rest of the run.
         revert = old_value if old_value is not None else self.knobs[knob_id].default
         self.current_values[knob_id] = self.knobs[knob_id].clamp(revert)
         short = self._short.get(knob_id, knob_id)
+        self._move_from.pop(short, None)     # a refused move is not in flight
         self._rejections[short] = self._rejections.get(short, 0) + 1
         logger.info("optimizer.cbandit.ack.reverted", knob_id=knob_id, status=status,
                     back_to=self.current_values[knob_id], rejections=self._rejections[short])
@@ -478,6 +612,85 @@ class CoordinateBanditPlanner:
                            rejections=self._rejections[short],
                            reason="the application refused this knob repeatedly; it is excluded "
                                   "from selection so it cannot absorb the escalation")
+
+    def _note_apply_cost(self, short, status, old_value, new_value, apply_cost_s, step_id=None):
+        """Keep what an applied change of this knob measurably cost, from the application's clock.
+
+        `step_id` (the applied step) lets a refined measurement replace the earlier one of the same
+        apply instead of adding a second sample.
+        """
+        if status != "applied" or apply_cost_s is None:
+            return
+        try:
+            cost = float(apply_cost_s)
+            step = abs(float(new_value) - float(old_value))
+        except (TypeError, ValueError):
+            return
+        if not (math.isfinite(cost) and cost >= 0.0 and step > 0.0):
+            return
+        hist = self._apply_costs.setdefault(short, [])
+        refined = step_id is not None and bool(hist) and self._cost_step_ids.get(short) == step_id
+        if refined:
+            hist[-1] = (step, cost)
+        else:
+            hist.append((step, cost))
+        if step_id is not None:
+            self._cost_step_ids[short] = step_id
+        logger.info("optimizer.cbandit.apply_cost", knob=short, step=step, cost_s=round(cost, 3),
+                    measurements=len(hist), refined=refined)
+
+    def _measured_apply_cost(self, short: str, current, value) -> Optional[float]:
+        """Seconds a move of `short` from `current` to `value` is predicted to hold training.
+
+        The latest measured apply of this knob, scaled by the size of the change (an apply forks
+        or retires workers in proportion to the change). None until this run has measured one:
+        no declared or default constant stands in for a measurement.
+        """
+        hist = self._apply_costs.get(short)
+        if not hist:
+            return None
+        try:
+            step = abs(float(value) - float(current))
+        except (TypeError, ValueError):
+            return None
+        last_step, last_cost = hist[-1]
+        return last_cost * (step / last_step) if last_step > 0 else last_cost
+
+    def _inflight_move(self) -> Optional[str]:
+        """The knob whose last move still awaits its verdict, or None.
+
+        A move enters `_move_from` when it is decided and leaves it when it is confirmed, reverted,
+        superseded by a different applied value, or refused by the application.
+        """
+        if self._joint_verify:
+            # Joint verification (opt-in) verifies a coupled pair of moves as one step, so it needs the
+            # second move to be allowed while the first awaits its verdict.
+            return None
+        for short, entry in self._move_from.items():
+            if entry[1] and entry[1] > 0:
+                return short
+        return None
+
+    def _apply_cost_veto(self, short, current, value, delta, remaining, window) -> Optional[str]:
+        """Decline a move whose predicted gain over the run left cannot repay its measured apply cost.
+
+        Predicted gain = the move's predicted per-step effect (`delta`, the lower confidence bound
+        of the domain's exposure) x the steps remaining; cost = what this knob's last measured
+        apply held training for, scaled by the size of the change. Both are measurements of this
+        run. Silent when there is no measured cost yet, no predicted effect, or no horizon.
+        """
+        if self._cost_w == 0.0 or delta is None or remaining is None:
+            return None
+        cost = self._measured_apply_cost(short, current, value)
+        if cost is None or cost <= 0.0:
+            return None
+        gain = float(delta) * float(remaining)
+        if gain > self._cost_w * cost:
+            return None
+        logger.info("optimizer.cbandit.apply_cost_veto", window=window, knob=short, current=current,
+                    to=value, predicted_gain_s=round(gain, 3), measured_cost_s=round(cost, 3),
+                    remaining=float(remaining))
+        return "unpayable_apply_cost:gain=%.1fs<=cost=%.1fs" % (gain, cost)
 
     def _reset_other_arms(self, short: str, window_index: int = -1):
         """A regime-changing knob was APPLIED: every other knob's history is now uncomparable.
@@ -509,6 +722,7 @@ class CoordinateBanditPlanner:
                          {k[0] for k in self._stats if k[0] != short})
         n_samples = sum(len(v) for k, v in self._samples.items() if k[0] != short)
         self._samples = {k: v for k, v in self._samples.items() if k[0] == short}
+        self._tail_samples = {k: v for k, v in self._tail_samples.items() if k[0] == short}
         self._stats = {k: v for k, v in self._stats.items() if k[0] == short}
         logger.info("optimizer.cbandit.regime_reset", knob=short, window=window_index,
                     reset_knobs=dropped, samples_discarded=n_samples,
@@ -520,9 +734,92 @@ class CoordinateBanditPlanner:
         for k, v in (finding.key_metrics or {}).items():
             self._win_metrics[k] = v
 
+    def _observed_cfg(self, window, metrics):
+        """Credit only fully post-application windows; a proposal is not application."""
+        if metrics.get("liveflow_v1_attribution") != 1.0:
+            return dict(self._planned_cfg.get(window, self._short_cfg()))
+        fields = ["physical_" + short for short in self._short.values()]
+        if fields and all(k in metrics for k in fields) and "physical_applied_step" in metrics:
+            cfg = {short: int(metrics["physical_" + short]) for short in self._short.values()}
+            step = int(metrics["physical_applied_step"])
+            # Cumulative step of the window's first step, the same axis as `physical_applied_step`
+            # (completed steps). `step_min` restarts every epoch, so across an epoch boundary it
+            # would call every later window an apply window.
+            first = None
+            if metrics.get("completed_steps") is not None and metrics.get("step_nunique") is not None:
+                first = metrics["completed_steps"] - metrics["step_nunique"] + 1
+            if first is None:
+                first = metrics.get("step_min")
+            if first is None or first <= step:
+                return None  # partial/apply-window state cannot be credited as an after sample
+            if self._physical_latest_cfg != cfg:
+                for kid, short in self._short.items():
+                    if self._physical_latest_cfg is not None and self._physical_latest_cfg.get(short) != cfg[short]:
+                        self._physical_changes.append((short, cfg[short], step))
+                        _was = self._physical_latest_cfg.get(short)
+                        if _was is not None:
+                            self._refine[short] = cfg[short] < _was
+                        self._physical_change_old[(short, step)] = _was
+                    self.current_values[kid] = cfg[short]
+                self._physical_latest_cfg = dict(cfg)
+            # Every node learns what the apply measurably cost from the shared applied-vector
+            # snapshot (not only the node that published the plan). The value is refined once, a
+            # window after the apply, when the stall of the step that followed it is known.
+            cost_us = _num_or_none(metrics.get("physical_apply_cost_us"))
+            if cost_us is not None and self._cost_by_step.get(step) != cost_us:
+                self._cost_by_step[step] = cost_us
+                for short, value, st in self._physical_changes:
+                    if st == step and self._physical_change_old.get((short, st)) is not None:
+                        self._note_apply_cost(short, "applied", self._physical_change_old[(short, st)],
+                                              value, cost_us / 1e6, step_id=step)
+            self._observation_first_steps[window] = float(first)
+            return cfg
+        if self._observed_initial_cfg is None:
+            self._observed_initial_cfg = self._short_cfg()
+        cfg = dict(self._observed_initial_cfg)
+        end = metrics.get("completed_steps")
+        count = metrics.get("step_nunique")
+        first = float(end) - float(count) + 1 if end is not None and count is not None else None
+        for short, value, effective_window, step in self._applied_changes:
+            after = first > step if first is not None and step is not None else window > effective_window
+            if after:
+                cfg[short] = value
+        return cfg
+
     def _finalize_window(self, window: int) -> Optional[dict]:
         m = self._win_metrics
+        if m.get("liveflow_v1_attribution") == 1.0:
+            if m.get("planner_history_ready") != 1 or m.get("lf_v1_per_step") != 1:
+                logger.info("optimizer.liveflow_v1.unready_history", window=window)
+                return None
+            self._rate_mode = True
+            self._control_steps = int(m.get("configured_window_steps") or m["step_nunique"])
+        if self._rate_mode and any(k.startswith("halo3d.") for k in self.knobs):
+            required = ("physical_read_threads", "physical_decode_threads", "physical_applied_step")
+            if not all(k in m for k in required) or self._observed_cfg(window, m) is None:
+                logger.info("optimizer.liveflow_v1.missing_physical_state", window=window)
+                return None
+        elif self._rate_mode:
+            # A workload whose application snapshots the applied vector (StorMer: num_workers,
+            # prefetch_factor) is credited from it, never from per-node ACKs. Once seen, a window
+            # without a coherent applied vector is not evidence about any configuration.
+            have = (all(("physical_" + sh) in m for sh in self._short.values())
+                    and "physical_applied_step" in m)
+            if have:
+                self._physical_seen = True
+            if self._physical_seen and (not have or self._observed_cfg(window, m) is None):
+                logger.info("optimizer.liveflow_v1.missing_physical_state", window=window,
+                            reason="no coherent applied vector, or an apply window")
+                return None
         wall = m.get("active_time")
+        # LiveDiagnoser forwards the analyzer's coherent control vector.  Its
+        # wall is authoritative for that vector and is intentionally named
+        # separately from the legacy aggregate `active_time`.  Do not invent a
+        # fallback for a partial vector: only use it when the explicit
+        # coherence marker is present, after which domains_from_metrics below
+        # validates every required coherent field.
+        if wall is None and "domain_coherent" in m:
+            wall = m.get("window_wall_time_proc_crit")
         if wall is None or wall <= 0:
             return None
         # ONE shared definition, so the two planners cannot drift and any difference between them
@@ -550,6 +847,9 @@ class CoordinateBanditPlanner:
         # the argmax, there is nothing to move and the planner declines. That is a comparison, not
         # a threshold -- no constant says how much unexplained time is "too much".
         unattributed = max(float(wall) - sum(domains.values()), 0.0)
+        skew = self._skew_from_metrics(m, wall) if self._skew_link and not self._rate_mode else None
+        if skew is not None:
+            domains, unattributed = skew["domains"], skew["unattributed"]
         remaining, remaining_unit = self._remaining_run(m)
         # When this window finished, so a completion timestamp can be turned into a window.
         self._window_finished_at[window] = _time.time()
@@ -568,6 +868,8 @@ class CoordinateBanditPlanner:
             epoch_key = m.get("epoch_index")
         if epoch_key is None and wpe:
             epoch_key = int(window // float(wpe))
+        if self._rate_mode:
+            epoch_key = "liveflow-v1-post-freeze"
         # THE FULL WINDOW INPUT, ON EVERY WINDOW INCLUDING A DECLINE.
         #
         # T3-0 4s.21: the replay harness could not reproduce the cosmoflow stage because
@@ -583,7 +885,7 @@ class CoordinateBanditPlanner:
                     nodes=self._nodes or None,
                     dest_read_gbs=self._dest_read_gbs or None,
                     stage_rate_gbs=self._stage_rate_gbs or None,
-                    cfg=dict(self._planned_cfg.get(window, self._short_cfg())))
+                    cfg=self._observed_cfg(window, m))
         # Establish/reset the epoch before accepting this window's domain
         # observation.  Appending first discarded the first observation of
         # every real epoch when `_note_epoch()` noticed the transition below.
@@ -600,9 +902,16 @@ class CoordinateBanditPlanner:
         for _d, _v in domains.items():
             self._epoch_dom.setdefault(_d, deque(maxlen=self._sample_window)).append(
                 float(_v or 0.0))
+        self._epoch_wall_hist.append(float(wall))
+        tail_us = _num_or_none(m.get("step_wall_p90_us"))
+        if tail_us is not None and tail_us >= 0.0:
+            self._epoch_tail_hist.append(tail_us / 1e6)
         return {
-            "cfg": dict(self._planned_cfg.get(window, self._short_cfg())),
+            "cfg": self._observed_cfg(window, m),
+            "tail": (tail_us / 1e6) if tail_us is not None and tail_us >= 0.0 else None,
             "domains": domains,
+            "skew": skew,
+            "skew_coverage": _num_or_none(m.get("domain_skew_coverage")),
             "unattributed": unattributed,
             "wall": float(wall),
             "remaining": remaining,
@@ -632,6 +941,9 @@ class CoordinateBanditPlanner:
         kind of aggregate. Inventing a default horizon would make the same actuator payable or
         unpayable based on a planner constant rather than the run that is actually left.
         """
+        if metrics.get("lf_v1_per_step") == 1.0:
+            value = _num_or_none(metrics.get("remaining_steps"))
+            return (max(value, 0.0), "steps") if value is not None else (None, None)
         for key, unit in (("windows_remaining", "windows"),
                           ("remaining_windows", "windows"),
                           ("epochs_remaining", "epochs"),
@@ -645,7 +957,7 @@ class CoordinateBanditPlanner:
                 continue
         return None, None
 
-    def _record(self, cfg: dict, wall: float):
+    def _record(self, cfg: dict, wall: float, window=None, tail: Optional[float] = None):
         """Credit the observed wall to every knob level that produced it.
 
         Attributing one wall time to each knob's level independently is the factored assumption --
@@ -653,6 +965,13 @@ class CoordinateBanditPlanner:
         right enough when each knob dominates its own domain, which is the case this system is
         built for.
         """
+        if window is not None and self._rate_mode:
+            self._credit_observations.append((window, dict(cfg), wall))
+            if tail is not None:
+                self._credit_tail[window] = float(tail)
+                if len(self._credit_tail) > 4 * self._sample_window:
+                    for old_window in sorted(self._credit_tail)[:-2 * self._sample_window]:
+                        del self._credit_tail[old_window]
         for short, level in cfg.items():
             # THE COPY'S OWN WINDOWS BELONG TO NEITHER REGIME (4s.31). Between the plan and the
             # actuator's completion the node is copying hundreds of GB while still reading the old
@@ -695,7 +1014,13 @@ class CoordinateBanditPlanner:
             if buf is None:
                 buf = self._samples[(short, level)] = deque(maxlen=self._sample_window)
             buf.append(float(wall))
+            if tail is not None:
+                tbuf = self._tail_samples.get((short, level))
+                if tbuf is None:
+                    tbuf = self._tail_samples[(short, level)] = deque(maxlen=self._sample_window)
+                tbuf.append(float(tail))
         self._total_pulls += 1
+        self._series.append((self._cur_window, dict(cfg), float(wall)))
 
     def _ring_drops(self) -> Optional[int]:
         """Cumulative trace records lost by the ring, or None if it cannot be asked.
@@ -736,6 +1061,8 @@ class CoordinateBanditPlanner:
             self._epoch_wall_sum = 0.0
             self._epoch_wall_sq = 0.0
             self._epoch_dom = {}
+            self._epoch_wall_hist.clear()
+            self._epoch_tail_hist.clear()
             self._epoch_dropped = False
             self._drops_at_epoch_start = self._ring_drops()
         # GB, NOT BYTES. `node_read_bytes` is raw bytes and every priced quantity downstream is in
@@ -854,12 +1181,45 @@ class CoordinateBanditPlanner:
             base_mean = entry[3] if len(entry) > 3 else None
             if not delta or delta <= 0:
                 continue
-            cur = self._short_cfg().get(short)
+            cur = (self._physical_latest_cfg or self._short_cfg()).get(short)
+            if self._physical_latest_cfg is not None:
+                if cur == old_value:
+                    continue  # proposed change is not physically observed yet
+                if len(entry) > 4 and cur != entry[4]:
+                    logger.info("optimizer.cbandit.move_superseded", knob=short, value=cur,
+                                predicted_value=entry[4], window=window)
+                    self._move_from.pop(short, None)
+                    continue
             if cur == old_value:
                 self._move_from.pop(short, None)
                 continue
             cand = list(self._samples.get((short, cur), ()))
+            cand_tail = list(self._tail_samples.get((short, cur), ()))
+            if self._rate_mode and short not in self._relocating:
+                changes = [c for c in (self._physical_changes if self._physical_latest_cfg is not None
+                                      else self._applied_changes) if c[0] == short]
+                if not changes:
+                    continue  # a proposal without an application has no after sample
+                last = changes[-1]
+                after = [(w, wall) for w, cfg, wall in self._credit_observations
+                         if ((self._observation_first_steps.get(w, -1) > last[2])
+                             if self._physical_latest_cfg is not None else w > last[2])
+                         and cfg.get(short) == cur][-self._sample_window:]
+                cand = [wall for _w, wall in after]
+                cand_tail = [self._credit_tail[w] for w, _wall in after if w in self._credit_tail]
             base = list(self._samples.get((short, old_value), ()))
+            base_tail = list(self._tail_samples.get((short, old_value), ()))
+            # A MOVE PREDICTED FROM THE RECENT EXPOSED RUN IS VERIFIED AGAINST THAT RUN'S OWN PRE-MOVE
+            # WINDOWS. The old value's arm also holds every window the knob spent at that value in an
+            # EARLIER regime (halo-regimes X: 15 phase-1 windows at read_threads=1 and ~80 ms/step,
+            # against a raw phase at ~270), so the arm-vs-arm test read a good move as worse and
+            # reverted it. Same observation as for a relocation (4s.30): the baseline is the regime
+            # the move left, as it was when the decision was taken.
+            _snap = self._move_base_walls.get(short) if short not in self._relocating else None
+            if _snap:
+                base = list(_snap)
+            if _snap:
+                base_tail = list(self._move_base_tails.get(short, ()))
 
             # A RELOCATION IS VERIFIED AGAINST THE REGIME IT LEFT, NOT AGAINST A LIVE ARM.
             #
@@ -910,7 +1270,74 @@ class CoordinateBanditPlanner:
                 self._move_from.pop(short, None)
                 continue
 
-            need, _ = self.required_dwell(remaining, short=short, value=old_value, delta=delta)
+            _sig = None
+            if _snap and len(_snap) >= 2:
+                _m = sum(_snap) / len(_snap)
+                _sig = (_m, math.sqrt(sum((x - _m) ** 2 for x in _snap) / (len(_snap) - 1)), len(_snap))
+            need, _ = self.required_dwell(remaining, short=short, value=old_value, delta=delta,
+                                          sigma_override=_sig)
+            # JOINT VERIFICATION (opt-in, DFOPTIMIZER_CBANDIT_JOINT_VERIFY=1; STORMER-LOOP-DESIGN sec 5).
+            # Relieving one domain can expose another (StorMer: a larger all-reduce bucket exposes periodic
+            # input stalls), so the cheaper-domain move is followed by a move in the OTHER domain.  The
+            # first move's arm then mixes windows from before and after the second move, and its own
+            # verification reads the exposed stall as harm and reverts the very move the follow-up needs.
+            # When another knob has moved since this one, verify the two as one step: the candidate is the
+            # arm of the most recently moved knob (both moves applied, configuration stationary since),
+            # the baseline is this knob's old arm (both knobs at their old values).  A failure reverts
+            # the most recent move first (LIFO).  Default OFF = the historical per-arm verification.
+            if self._joint_verify:
+                # Configuration-keyed samples (D1b).  Candidate: windows that ran the CURRENT whole configuration
+                # strictly after the most recent move of any pending knob (so a value tried, reverted and retried
+                # earlier cannot leak in).  Baseline: windows at or before this move that ran the configuration
+                # it left (this knob at its old value, every knob moved since restored to its own old value).
+                pending = [(self._last_move_window.get(s2, -10**9), s2) for s2 in self._move_from
+                           if s2 != short and self._last_move_window.get(s2, -10**9) > _w]
+                t_last = max([_w] + [wm for wm, _s in pending])
+                cur_cfg = dict(self._short_cfg())
+                base_cfg = dict(cur_cfg)
+                base_cfg[short] = old_value
+                for _wm, s2 in pending:
+                    base_cfg[s2] = self._move_from[s2][0]
+                jcand = [wl for (wi, cf, wl) in self._series if wi > t_last and cf == cur_cfg]
+                jbase = [wl for (wi, cf, wl) in self._series if wi <= _w and cf == base_cfg]
+                if len(jcand) < need or len(jbase) < self._min_samples:
+                    continue
+                if accept_decision(jbase, jcand, alpha=self._alpha,
+                                   effect_floor=self._effect_floor) != "accept":
+                    if pending:                       # LIFO: the most recent move goes back first
+                        latest = max(pending)[1]
+                        return latest, self._move_from[latest][0]
+                    return short, old_value
+                logger.info(
+                    "optimizer.cbandit.move_confirmed", window=window, knob=short, value=cur,
+                    n=len(jcand), mean=round(statistics.mean(jcand), 4), base_n=len(jbase),
+                    base_mean=round(statistics.mean(jbase), 4), delta=round(float(delta), 4),
+                    n_required=int(need), verdict="confirmed_joint" if pending else "confirmed",
+                    joint_with=[s2 for _wm, s2 in pending] or None,
+                    reason="the stationary configuration accepts against the one it left")
+                self._move_from.pop(short, None)
+                continue
+            # TAIL-AWARE VERIFICATION. The mean wall per step is dominated by a few long steps (a
+            # stall is seconds against a ~0.3 s step), so a change that halves them can leave a
+            # window mean unchanged and the mean test alone reverts it. The same per-step family
+            # also gives each window's p90 step wall. A move is CONFIRMED when either the mean or
+            # the p90 is significantly and meaningfully lower than the arm it left (the same
+            # accept_decision, alpha and effect floor) and the mean is not significantly worse;
+            # it is reverted only when neither is. Minimum-samples rule unchanged: each arm needs
+            # `min_samples` windows of the metric.
+            tail_ok = self._tail_accepts(base_tail, cand_tail, base, cand)
+            if tail_ok and len(cand) >= self._min_samples and len(base) >= self._min_samples:
+                logger.info(
+                    "optimizer.cbandit.move_confirmed", window=window, knob=short, value=cur,
+                    n=len(cand), mean=round(statistics.mean(cand), 4),
+                    base_n=len(base), base_mean=round(statistics.mean(base), 4),
+                    metric="p90_step_wall", tail_n=len(cand_tail),
+                    tail=round(statistics.mean(cand_tail), 4),
+                    base_tail_n=len(base_tail), base_tail=round(statistics.mean(base_tail), 4),
+                    delta=round(float(delta), 4), n_required=int(need), verdict="confirmed_tail",
+                    reason="the moved arm's p90 step wall accepts against the arm it left")
+                self._move_from.pop(short, None)
+                continue
             if len(cand) < need or len(base) < self._min_samples:
                 continue
             if accept_decision(base, cand, alpha=self._alpha,
@@ -922,11 +1349,27 @@ class CoordinateBanditPlanner:
                 "optimizer.cbandit.move_confirmed", window=window, knob=short, value=cur,
                 n=len(cand), mean=round(statistics.mean(cand), 4),
                 base_n=len(base), base_mean=round(statistics.mean(base), 4),
+                metric="mean_wall",
                 predicted=round(max(statistics.mean(base) - float(delta), 0.0), 4),
                 delta=round(float(delta), 4), n_required=int(need), verdict="confirmed",
                 reason="the moved arm accepts against the arm it left")
             self._move_from.pop(short, None)
         return None
+
+    def _tail_accepts(self, base_tail, cand_tail, base, cand) -> bool:
+        """Is the candidate arm's per-window p90 step wall significantly and meaningfully lower?
+
+        Same decision rule as the mean (`accept_decision`: Welch p < alpha and relative gain >=
+        effect_floor), guarded so a lower tail never excuses a significantly worse mean. False
+        unless both arms have `min_samples` windows of the metric.
+        """
+        if len(base_tail) < self._min_samples or len(cand_tail) < self._min_samples:
+            return False
+        guard = len(base) > 1 and len(cand) > 1
+        return accept_decision(base_tail, cand_tail, alpha=self._alpha,
+                               effect_floor=self._effect_floor,
+                               guard_base=base if guard else None,
+                               guard_cand=cand if guard else None) == "accept"
 
     @staticmethod
     def _median_lower_bound(values, alpha: float) -> Optional[float]:
@@ -1061,7 +1504,8 @@ class CoordinateBanditPlanner:
         return self._median_lower_bound(vals, self._alpha)
 
     def predicted_effect(self, short: str, dom: str,
-                         reloc_gain: Optional[float] = None) -> Tuple[Optional[float], str]:
+                         reloc_gain: Optional[float] = None,
+                         window_exposure: Optional[float] = None) -> Tuple[Optional[float], str]:
         """The candidate's predicted per-window effect, and where it came from.
 
         Project owner decision, 2026-09-05 (T3-0 4s.23). The planner acts only on moves whose effect
@@ -1076,6 +1520,16 @@ class CoordinateBanditPlanner:
 
         No preferred direction: both neighbours of a knob get the same delta and the acceptance test
         decides between them.
+
+        `window_exposure` (STORMER-LOOP-DESIGN sec 17, opt-in `DFOPTIMIZER_CBANDIT_COMM_EFFECT_CAP_WINDOW`):
+        the CURRENT window's own measured exposure for `own`, when the caller has it. A `bucket_cap_mb`
+        move cannot physically remove more comm time than the comm domain is currently measured to be
+        paying THIS window -- the epoch-to-date accumulator above can run ahead of that (it pools across
+        windows, some of which may have carried more exposure than the freshest one), so this clamps
+        DOWN ONLY, never up: `ex = min(ex, window_exposure)`. Scoped to `own == "comm"` only, per the
+        orchestrator's spec; other domains are unaffected. Disabled by default -- it can only make the
+        planner more conservative, never license a new action, but ships opt-in like every other
+        addition in this file until reviewed.
         """
         if short in self._relocating:
             return (reloc_gain, "relocation_gain") if reloc_gain and reloc_gain > 0 else (
@@ -1083,14 +1537,93 @@ class CoordinateBanditPlanner:
         own = self._domain.get(short)
         if not own:
             return None, "no_domain"
+        if self._rate_mode and self._epoch_windows < self._min_samples:
+            return None, "insufficient_samples:%d<%d" % (self._epoch_windows, self._min_samples)
         ex = self._epoch_domain_exposed(own)
         if ex is None or ex <= 0.0:
+            # The epoch-to-date lower bound is None or zero when the domain was unexposed for most of
+            # the epoch and has only just become exposed (a regime shift: halo-regimes X, z9 -> raw,
+            # where 15 zero-input windows put the median bound at 0 for the whole raw phase while
+            # the attributed storage wait was 10-130 ms per step). That is a statement about the
+            # PAST epoch, not about the exposure now being measured. See _recent_run_effect.
+            rec = self._recent_run_effect(short, own)
+            if rec is not None:
+                return rec
             return None, "no_exposed_time"
+        if (self._comm_effect_cap_window and own == "comm" and window_exposure is not None
+                and math.isfinite(window_exposure) and window_exposure >= 0.0):
+            ex = min(ex, window_exposure)
+            if ex <= 0.0:
+                return None, "no_exposed_time"
         return ex, "domain_exposed:%s" % own
+
+    def _recent_run_effect(self, short: str, dom: str) -> Optional[Tuple[float, str]]:
+        """Predicted per-window effect of the NEXT level of `short`, from the measured exposure now.
+
+        Used only when the epoch-to-date bound of the owned domain is unusable (see predicted_effect)
+        AND nothing measured exists at any higher level of this knob (a measured comparison, once it
+        exists, decides instead; this is the first step, not a replacement for that test).
+
+        Measured exposure: the exposure of the domain's current unbroken run of exposed windows, taken
+        at its MINIMUM (a lower bound of what is exposed now), and only once the run is as long as the
+        planner's own `min_samples` (the same evidence count every other estimate here waits for).
+
+        Overlap/Amdahl form for a worker pool: a stage's service rate scales with its workers, so the
+        wait it exposes scales as cur/next. Going cur -> next therefore removes the share
+        1 - cur/next of the measured exposure. Bounded above by the measured exposure by construction,
+        a lower bound on the removable wait whenever the stage is the binding one (the wait left after
+        the move can only be smaller). No new constant: the levels are the knob's own, the run length
+        is `min_samples`. The apply cost is NOT netted here; `_pick` prices it against the horizon.
+        """
+        levels = self._levels.get(short) or []
+        try:
+            cur = _num(self._short_cfg().get(short))
+            higher = [v for v in levels if _num(v) > cur]
+        except (TypeError, ValueError):
+            return None
+        if not higher or cur is None or cur <= 0:
+            return None
+        if any(self._samples.get((short, v)) for v in higher):
+            return None
+        run = []
+        for v in reversed(list(self._epoch_dom.get(dom) or ())):
+            if v is None or v <= 0.0:
+                break
+            run.append(float(v))
+        if len(run) < self._min_samples:
+            return None
+        nxt = self._next_up(short, self._short_cfg().get(short))
+        if nxt is None:
+            return None
+        share = 1.0 - cur / _num(nxt)
+        if share <= 0.0:
+            return None
+        # The exposure SUSTAINED over the last `min_samples` windows of the run (its minimum), not the
+        # run's own minimum: a run that began on a ramp would otherwise be priced by its first window.
+        self._recent_run_n = len(run)
+        sustained = min(run[:self._min_samples])
+        return sustained * share, "domain_exposed_recent_run:%s:amdahl:%s->%s" % (dom, cur, nxt)
+
+    def _recent_run_sigma(self) -> Optional[Tuple[float, float, int]]:
+        """(mean, sigma, n) of the window wall over the recent exposed run, or None.
+
+        The effect predicted from the recent run is tested against the noise of that same run. The
+        knob's within-arm samples (and the epoch wall) span every regime the run has been through, so
+        after a shift their spread is the shift itself, which is the signal and not the noise a
+        verification of this move has to see through (same argument as _within_arm_sigma).
+        """
+        n = min(self._recent_run_n, len(self._epoch_wall_hist))
+        if n < 2:
+            return None
+        walls = list(self._epoch_wall_hist)[-n:]
+        mean = sum(walls) / n
+        var = sum((x - mean) ** 2 for x in walls) / (n - 1)
+        return mean, math.sqrt(var), n
 
     def required_dwell(self, remaining: Optional[float] = None,
                        short: Optional[str] = None, value=None,
-                       delta: Optional[float] = None) -> Tuple[int, dict]:
+                       delta: Optional[float] = None,
+                       sigma_override: Optional[Tuple[float, float, int]] = None) -> Tuple[int, dict]:
         """How many windows a value must be held to be worth testing, from the observed variance.
 
         Returns (dwell, why) where `why` carries the terms so a decision can be read back. The
@@ -1104,8 +1637,11 @@ class CoordinateBanditPlanner:
         which is the whole point: `neighbourhood_exhausted_no_help` may not be declared from a
         sample that could not have contained the cost (4s.17).
         """
-        st = self._within_arm_sigma(short, value) if short else None
-        src = "within_arm"
+        st = sigma_override
+        src = "recent_run"
+        if st is None:
+            st = self._within_arm_sigma(short, value) if short else None
+            src = "within_arm"
         if st is None:
             st = self._epoch_wall_stats()
             src = "epoch_wall"
@@ -1129,10 +1665,13 @@ class CoordinateBanditPlanner:
         n_req = int(math.ceil((z * sigma / delta) ** 2))
         why["n_required"] = n_req
         dwell = max(self._min_samples, n_req)
-        if remaining is not None and remaining > 0 and dwell > remaining:
+        needed_steps = dwell * self._control_steps if self._rate_mode else dwell
+        if self._rate_mode:
+            why.update(n_required_steps=n_req * self._control_steps, dwell_steps=needed_steps, horizon_unit="steps")
+        if remaining is not None and remaining > 0 and needed_steps > remaining:
             why.update(reason="exceeds_horizon", reachable=False,
                        horizon=int(remaining))
-            return int(remaining), why
+            return int(remaining // self._control_steps) if self._rate_mode else int(remaining), why
         why.update(reason="derived", reachable=True)
         return dwell, why
 
@@ -1294,11 +1833,36 @@ class CoordinateBanditPlanner:
             # Current value is off-grid (e.g. an app default between levels): snap to the nearest.
             i = min(range(len(levels)), key=lambda j: abs(_num(levels[j]) - _num(current)))
         out = [levels[i]]
+        if self._rate_mode and short in _POOL_KNOBS:
+            half = [v for v in levels if _num(v) < _num(levels[i]) and _num(v) <= _num(levels[i]) // 2]
+            if half:
+                out.append(max(half, key=_num))
+            up = self._next_up(short, levels[i])
+            if up is not None:
+                out.append(up)
+            return out
         if i > 0:
             out.append(levels[i - 1])
         if i + 1 < len(levels):
             out.append(levels[i + 1])
         return out
+
+    def _next_up(self, short: str, current):
+        """The next HIGHER level a raise of `short` proposes, or None at the declared maximum.
+
+        Worker/thread counts in rate mode move geometrically: current x2 (1->2->4->8), capped at the
+        declared maximum (the largest level not above x2 that is still above current). After an
+        observed revert the next raise from the restored level is one refinement step (+1, the next
+        level on the grid), then geometric again. Other knobs keep the grid neighbour.
+        """
+        levels = sorted(self._levels.get(short) or [current], key=_num)
+        higher = [v for v in levels if _num(v) > _num(current)]
+        if not higher:
+            return None
+        if not (self._rate_mode and short in _POOL_KNOBS) or self._refine.get(short):
+            return higher[0]
+        within = [v for v in higher if _num(v) <= 2 * _num(current)]
+        return max(within, key=_num) if within else higher[0]
 
     def _pick(self, short: str, current, domain: str, exposed_s: Optional[float] = None,
               remaining: Optional[float] = None, cost_override: Optional[float] = None,
@@ -1315,6 +1879,15 @@ class CoordinateBanditPlanner:
         horizon is not payable. COST_W=0 removes the cost and payback terms for the ablation.
         """
         cands = self._neighbourhood(short, current)
+        self._last_pick_note = None
+        if self._strict_explore and short in self._shipped and short not in self._relocating:
+            # A2(2): never explore below the shipped value (over-provisioned capacity decreases are
+            # admitted earlier, on their own measured path, and never reach _pick).
+            try:
+                floor = _num(self._shipped[short])
+                cands = [lv for lv in cands if lv == current or _num(lv) >= floor]
+            except (TypeError, ValueError):
+                pass
         seen = [m for (s, _l), (n, m) in self._stats.items() if s == short and n > 0]
         optimistic = min(seen) if seen else 0.0
         # PRIOR FOR AN UNTRIED ARM = the CURRENT arm's performance, not the best ever seen.
@@ -1434,6 +2007,13 @@ class CoordinateBanditPlanner:
                            "score": _rounded(score)})
             if score < best_score:
                 best, best_score = lv, score
+        if self._strict_explore and best != current and best_score != float("inf"):
+            # A2(1): an exact tie for the best score carries no directional prediction.
+            tied = [d for d in detail if d["level"] != best and d["score"] is not None
+                    and d["level"] != current and d["score"] == _rounded(best_score)]
+            if tied:
+                self._last_pick_note = "tie_no_prediction:%s~%s" % (best, tied[0]["level"])
+                return current, detail
         return best, detail
 
     def _move_cost(self, short: str, value) -> float:
@@ -1446,6 +2026,10 @@ class CoordinateBanditPlanner:
         cfg = self._short_cfg()
         if short in cfg and cfg[short] == value:
             return 0.0
+        # What this knob's own applies have measurably cost beats any declaration.
+        measured = self._measured_apply_cost(short, cfg.get(short), value)
+        if measured is not None:
+            return measured
         for kid, kd in self.knobs.items():
             if self._short.get(kid) == short:
                 try:
@@ -1510,7 +2094,64 @@ class CoordinateBanditPlanner:
         This predicate is the trigger only; the comparison against the ceiling is separate, so a
         run with no ceiling still gets the redirection and simply cannot order the candidates by it.
         """
+        if not self._barrier_redirect:
+            return False
         return dom == "comm" and "comm" not in actionable
+
+    @staticmethod
+    def _skew_from_metrics(m: dict, wall) -> Optional[dict]:
+        """The measured skew link for this window, or None (suppressed, never invented)."""
+        def f(key):
+            v = m.get(key)
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                return None
+            return v if math.isfinite(v) else None
+        cov, a = f("domain_skew_coverage"), f("domain_input_skew_attributed_time")
+        if cov != 1.0 or a is None or not a > 0.0:
+            return None
+        typ = {k: f("domain_%s_time_proc_typ" % k) for k in ("input", "decode", "comm", "compute")}
+        if any(v is None or v < 0.0 for v in typ.values()):
+            return None
+        e, w = f("domain_input_skew_excess_time"), f("domain_comm_barrier_wait_time")
+        late = f("domain_skew_late_proc_input_time")
+        if e is None or w is None or a > min(e, w) + 1e-9 or a > typ["comm"] + 1e-9:
+            return None                       # inconsistent with A = min(E, W) <= comm: refuse
+        wall_typ = f("window_wall_time_proc_typ")
+        wall_typ = wall_typ if wall_typ and wall_typ > 0 else float(wall)
+        primed = {"input": typ["input"] + a, "decode": typ["decode"],
+                  "comm": max(typ["comm"] - a, 0.0), "compute": typ["compute"]}
+        unattr = max(wall_typ - sum(typ.values()), 0.0)
+        return {"A": a, "E": e, "W": w, "L": late, "domains": primed, "unattributed": unattr}
+
+    def _decision_path(self, dom, storage_suspect: bool, via: str = "", obs=None) -> dict:
+        """Which path produced a decision, recorded on EVERY decision record (A1) with this node's
+        configuration at decision time (A2 per-node timeline: control is node-local)."""
+        sk = (obs or {}).get("skew")
+        nd = (obs or {}).get("actionable_nondominant")
+        if via:
+            path = via
+        elif nd and dom == nd["domain"]:
+            path = "actionable_nondominant(%s,exposure=%.4g,dominant=%s%s)" % (
+                nd["domain"], nd["exposure"], nd["dominant"],
+                (",skew_A=%.4g" % sk["A"]) if sk else "")
+        elif sk and dom == "input":
+            path = "skew_attributed(A=%.4g,E=%.4g,W=%.4g,L=%s)" % (
+                sk["A"], sk["E"], sk["W"], "na" if sk["L"] is None else "%.4g" % sk["L"])
+        elif storage_suspect:
+            path = "barrier_redirect"
+        elif dom == "input":
+            path = "direct_input"
+        elif dom == "comm":
+            path = "comm"
+        else:
+            path = "dominant_domain:%s" % dom
+        return {"decision_path": path, "skew_link_enabled": self._skew_link,
+                "barrier_redirect_enabled": self._barrier_redirect,
+                "strict_explore": self._strict_explore,
+                "node": os.uname().nodename,
+                "config_at_decision": {k: v for k, v in self._short_cfg().items()}}
 
     def _storage_first_order(self, owned: List[str], bw: Optional[float]) -> Tuple[List[str], str]:
         """Order the storage candidates by what the ceiling comparison says is possible.
@@ -1674,18 +2315,56 @@ class CoordinateBanditPlanner:
 
         verdict = accept_decision(base, cand,
                                   alpha=self._alpha, effect_floor=self._effect_floor)
+        if verdict != "accept" and self._tail_accepts(
+                list(self._tail_samples.get((short, current), ())),
+                list(self._tail_samples.get((short, candidate), ())), base, cand):
+            return True, "accept_tail"
         return verdict == "accept", verdict
 
     # --- Planner-compatible decision entry ---
+    def process_window_completion(self, window_index: int, *, terminal: bool = False) -> List[ActionPlan]:
+        """Finalize one pending fact window when its native successor completes.
+
+        A completion is not a finding.  Terminal completion is deliberately a
+        no-op: end-of-stream must never manufacture a last action.
+        """
+        if terminal or self._cur_window == -1 or self._pending_finding is None:
+            return []
+        # Completion is a watermark for the *immediate* successor, not a
+        # permission to silently bridge missing/reordered native windows.
+        # A later marker would stamp a decision with a window whose evidence
+        # belongs to an older one, so it is intentionally declined.
+        # The flat view emitted beside the pending finding has the same native
+        # window identity.  It is an ordinary same-window completion, not an
+        # ordering fault and not a decision trigger; wait for a fact-free
+        # immediate successor.  Older/duplicate markers are equally inert.
+        if window_index <= self._cur_window:
+            return []
+        if window_index != self._cur_window + 1:
+            logger.warning("optimizer.cbandit.window_completion.ordering_gap",
+                           pending_window=self._cur_window,
+                           completion_window=window_index)
+            return []
+        marker = _dc.replace(self._pending_finding, window_index=window_index)
+        plans = self.process_finding(marker)
+        # `process_finding` has installed the marker as a new current window.
+        # Remove it: no-fact windows never accumulate control evidence.
+        self._cur_window = -1
+        self._win_metrics = {}
+        self._pending_finding = None
+        return plans
+
     def process_finding(self, finding: DiagnosisFindingMsg) -> List[ActionPlan]:
         if not self.knobs:
             return []
         w = finding.window_index
         if self._cur_window == -1:
             self._cur_window = w
+            self._pending_finding = finding
             self._accumulate(finding)
             return []
         if w == self._cur_window:
+            self._pending_finding = finding
             self._accumulate(finding)
             return []
 
@@ -1693,7 +2372,34 @@ class CoordinateBanditPlanner:
         obs = self._finalize_window(completed)
         plans: List[ActionPlan] = []
         if obs is not None:
-            self._record(obs["cfg"], obs["wall"])
+            self._record(obs["cfg"], obs["wall"], window=completed, tail=obs.get("tail"))
+
+            # Verification runs even when this window has no actionable exposure.
+            revert = self._unconfirmed_move(completed, obs.get("remaining"))
+            if revert is not None:
+                rshort, rback = revert
+                nxt = dict(self._short_cfg())
+                nxt[rshort] = rback
+                self._planned_cfg[w + 1] = dict(nxt)
+                self._last_move_window[rshort] = completed
+                self._move_from.pop(rshort, None)
+                logger.info("optimizer.cbandit.reverted", window=completed, knob=rshort,
+                            back_to=rback,
+                            reason="not confirmed at its predicted effect")
+                self._cur_window = w
+                self._win_metrics = {}
+                self._pending_finding = finding
+                self._accumulate(finding)
+                return self._plans_for(nxt, finding, self._domain[rshort])
+
+            if self._win_metrics.get("observation_only") == 1.0:
+                logger.info("optimizer.cbandit.observation", window=completed,
+                            reason="measured zero exposure; recorded without a new move")
+                self._cur_window = w
+                self._win_metrics = {}
+                self._pending_finding = finding
+                self._accumulate(finding)
+                return plans
 
             # 1. CROSS-LAYER DIRECTION: the dominant domain by measured time. A comparison, not a
             #    threshold -- this is the part the paper's contribution rests on.
@@ -1706,14 +2412,37 @@ class CoordinateBanditPlanner:
                 # signature a reader checks for -- not whether a knob moved.
                 doms = {"wall": float(wall)}
             actionable = {d for d in self._domain.values()}
-            # The unexplained remainder COMPETES in the argmax. It owns no knob, so if it is the
-            # largest share of the step the planner has nothing to move and declines -- which is
-            # the correct response to "most of this step is something I cannot name". Actuation
-            # cost ranks candidates only after raw exposed time has named the dominant domain.
-            ranked = sorted(((v, d) for d, v in doms.items()), reverse=True)
+            if self._comm_needs_skew and obs.get("skew_coverage") != 1.0:
+                actionable.discard("comm")
+            # Read unconditionally: later logging on the move/stay path (`unattributed=...`) needs
+            # it in both branches, even though only the non-B2 branch lets it compete in `ranked`.
             unattr = obs.get("unattributed", 0.0)
-            if unattr > 0:
-                ranked = sorted(ranked + [(unattr, "unattributed")], reverse=True)
+            if self._b2_input_only:
+                # E2: gate on input's OWN exposure, never on an argmax against "other". "other"
+                # (compute+comm+anything else B2 cannot separate) is deliberately never constructed
+                # as a ranked candidate here, so it can never win or suppress this decision.
+                input_v = doms.get("input")
+                if input_v is not None and math.isfinite(input_v) and input_v > 0.0:
+                    ranked = [(input_v, "input")]
+                else:
+                    logger.info(
+                        "optimizer.cbandit.decision", window=completed, decision="decline",
+                        reason="b2_input_only: no positive input exposure this window",
+                        dominant="input", gain_s=0.0, cost_s=0.0,
+                        horizon_count=obs.get("remaining"), horizon_unit=obs.get("remaining_unit"),
+                        escalation_state="not_actionable",
+                        decision_path="b2_input_only_absent",
+                        domain_times={k: round(float(v), 4) for k, v in doms.items()},
+                        wall=round(wall, 4))
+                    ranked = []
+            else:
+                # The unexplained remainder COMPETES in the argmax. It owns no knob, so if it is the
+                # largest share of the step the planner has nothing to move and declines -- which is
+                # the correct response to "most of this step is something I cannot name". Actuation
+                # cost ranks candidates only after raw exposed time has named the dominant domain.
+                ranked = sorted(((v, d) for d, v in doms.items()), reverse=True)
+                if unattr > 0:
+                    ranked = sorted(ranked + [(unattr, "unattributed")], reverse=True)
             # BARRIER ATTRIBUTION, option 1 (user decision 2026-09-03; T3-0 section 4m). A
             # comm-dominant window with no comm knob is not "nothing to do": on a bulk-synchronous
             # step the barrier is where the slowest rank's storage tail is paid by everyone else,
@@ -1723,12 +2452,25 @@ class CoordinateBanditPlanner:
             storage_suspect = False
             suspect_bw = None
             suspect_reason = None
-            if ranked and self._barrier_is_storage_suspect(ranked[0][1], actionable):
+            if (ranked and self._win_metrics.get("liveflow_v1_attribution") != 1.0
+                    and self._barrier_is_storage_suspect(ranked[0][1], actionable)):
                 if any(self._domain[s] == "input" for s in self._short.values()):
                     storage_suspect = True
                     suspect_bw = self._node_read_bandwidth(obs)
                     ranked = [(doms.get("input", 0.0), "input")] + [
                         r for r in ranked if r[1] != "input"]
+
+            if self._win_metrics.get("liveflow_v1_attribution") == 1.0:
+                # An exposure without a registered actuator is a finding, not a veto.
+                blocked = [(value, domain) for value, domain in ranked if domain not in actionable]
+                if blocked:
+                    logger.info("optimizer.cbandit.unactuatable_exposure", window=completed,
+                                exposures=dict((domain, value) for value, domain in blocked))
+                ranked = [(value, domain) for value, domain in ranked
+                          if domain in actionable and value > 0.0
+                          and any(self._domain[short] == domain and self._rejections.get(short, 0) < self._retire_after
+                                  for short in self._short.values())]
+                storage_suspect = False
 
             # C2 ABLATION (`_always_act`): guards ONLY this decline, nothing past it. When it
             # fires, `ranked[0]` may still name a domain with no owned knob, and the `owned = [...]`
@@ -1736,6 +2478,20 @@ class CoordinateBanditPlanner:
             # -- same numeric outcome as a decline, but with no `decision="decline"
             # reason="dominant share of the step is unattributed"` record. That absence, not a
             # changed knob value, is the mechanism signature to check (T3-0 4s.56).
+            nondominant = None
+            if (self._actionable_priority and ranked and ranked[0][1] not in actionable
+                    and not storage_suspect):
+                cands = [(float(v), d) for d, v in doms.items() if d in actionable and float(v) > 0.0]
+                # GUARD (judge batch 2, C2a): the "dominant share unattributed" decline is a safety
+                # guard.  Prioritization never fires when the window's unattributed residual is at least
+                # the actionable exposure it would chase (a residual-dominant window still declines).
+                if cands and float(obs.get("unattributed", 0.0) or 0.0) >= max(cands)[0]:
+                    cands = []
+                if cands:
+                    _ev, _ed = max(cands)
+                    nondominant = {"domain": _ed, "exposure": _ev, "dominant": ranked[0][1]}
+                    obs["actionable_nondominant"] = nondominant
+                    ranked = [(_ev, _ed)] + [r for r in ranked if r[1] != _ed]
             if ranked and ranked[0][1] not in actionable and not self._always_act:
                 _bw = self._node_read_bandwidth(obs)
                 logger.info(
@@ -1758,6 +2514,7 @@ class CoordinateBanditPlanner:
                     ceiling_gbs=self._lustre_ceiling_gbs or None,
                     bw_source=self._last_bw_source,
                     storage_suspect=storage_suspect,
+                    **self._decision_path(ranked[0][1], storage_suspect, "decline_unattributed", obs=obs),
                     domain_times={k: round(float(v), 4) for k, v in doms.items()},
                     wall=round(wall, 4))
                 ranked = []
@@ -1816,19 +2573,6 @@ class CoordinateBanditPlanner:
                     # own prediction required, the acceptance test is run against the value it came
                     # from; if it does not accept, the move goes back. A move that was worth making
                     # on a prediction is not worth keeping without one.
-                    revert = self._unconfirmed_move(completed, obs.get("remaining"))
-                    if revert is not None:
-                        rshort, rback = revert
-                        nxt = dict(self._short_cfg())
-                        nxt[rshort] = rback
-                        self._planned_cfg[w + 1] = dict(nxt)
-                        self._last_move_window[rshort] = completed
-                        self._move_from.pop(rshort, None)
-                        logger.info("optimizer.cbandit.reverted", window=completed, knob=rshort,
-                                    back_to=rback,
-                                    reason="not confirmed at its predicted effect")
-                        return self._plans_for(nxt, finding, "input")
-
                     cfg_now = self._short_cfg()
                     short, cur, choice, detail, why = None, None, None, [], "no_change"
                     tried = []
@@ -1908,10 +2652,23 @@ class CoordinateBanditPlanner:
                         # the no-gate ablation and must recover the previous behaviour exactly, the
                         # same reason the dwell is skipped there. Caught by C8, whose ungated arm
                         # stopped thrashing on one seed and so stopped being a control.
-                        delta, delta_src = (self.predicted_effect(
-                            cand_short, dom, reloc_gain=reloc_gain_last)
-                            if (self._accept_enabled and self._predicted_effect_gate)
-                            else (None, "gate_disabled"))
+                        # `window_exposure` is passed ONLY when the sec 17 flag is on -- the default
+                        # call must stay byte-identical to before this section existed (a caller that
+                        # stubs `predicted_effect` with the OLD signature, e.g.
+                        # test_cbandit_no_predicted_effect.py, must keep working when the flag is off;
+                        # a keyword arg present with value None still breaks a stub with no such
+                        # parameter at all).
+                        if self._comm_effect_cap_window:
+                            delta, delta_src = (self.predicted_effect(
+                                cand_short, dom, reloc_gain=reloc_gain_last,
+                                window_exposure=doms.get(dom))
+                                if (self._accept_enabled and self._predicted_effect_gate)
+                                else (None, "gate_disabled"))
+                        else:
+                            delta, delta_src = (self.predicted_effect(
+                                cand_short, dom, reloc_gain=reloc_gain_last)
+                                if (self._accept_enabled and self._predicted_effect_gate)
+                                else (None, "gate_disabled"))
                         rem_w = obs.get("remaining")
                         # THE HORIZON A RELOCATION IS PAID OVER STARTS AT THE REBUILD (4s.39). The
                         # windows left in this epoch read the old source whatever the knob says, so
@@ -1995,6 +2752,8 @@ class CoordinateBanditPlanner:
                                     "optimizer.cbandit.decision", window=completed,
                                     decision="move", knob=cand_short, current=cand_cur, chose=_to,
                                     accept="explore_over_provisioned",
+                                    **self._decision_path(dom, storage_suspect,
+                                                          "capacity_over_provisioned"),
                                     dominant_domain=dom, domain_times={
                                         k: round(float(v), 4) for k, v in doms.items()},
                                     capacity_limit=round(_cap, 3), gain_s=0.0, cost_s=0.0,
@@ -2009,8 +2768,11 @@ class CoordinateBanditPlanner:
                                 short, cur, choice, detail, why = (
                                     cand_short, cand_cur, cand_cur, [], "no_predicted_effect")
                             continue
-                        need_v, vwhy = ((self.required_dwell(rem_w, short=cand_short,
-                                                            value=cand_cur, delta=delta))
+                        need_v, vwhy = ((self.required_dwell(
+                            rem_w, short=cand_short, value=cand_cur, delta=delta,
+                            sigma_override=(self._recent_run_sigma()
+                                            if str(delta_src).startswith("domain_exposed_recent_run")
+                                            else None)))
                                         if delta is not None else (0, {}))
                         # NO HORIZON IS NOT AN UNBOUNDED ONE. "Admitted when n_required fits the
                         # windows remaining" cannot be satisfied when there are no windows
@@ -2042,10 +2804,32 @@ class CoordinateBanditPlanner:
                             cand_short, cand_cur, dom, exposed_s=cand_exposed,
                             remaining=rem_w, cost_override=cand_cost_override,
                             measured_gain_only=(cand_short in self._relocating))
+                        if cand_choice != cand_cur:
+                            # ONE CHANGE IN FLIGHT. No move on any knob until the previous move has
+                            # its verdict (confirmed or reverted), which needs `min_samples` CLEAN
+                            # post-apply windows of the moved arm.
+                            _inflight = self._inflight_move()
+                            # A RAMP CONTINUES: the same knob moving further in the direction of its
+                            # unverified move is one change in flight, not a second one (halo regimes
+                            # X, geometric steps: 1 -> 2 -> 4 must not wait for a verdict on 1 -> 2).
+                            # The next verdict is then taken against the level it left.
+                            _ramp = (_inflight == cand_short
+                                     and cand_cur > self._move_from[cand_short][0]
+                                     and cand_choice > cand_cur)
+                            if _inflight is not None and not _ramp:
+                                cand_choice = cand_cur
+                                self._last_pick_note = "verdict_pending:%s" % _inflight
+                        if cand_choice != cand_cur:
+                            _veto = self._apply_cost_veto(cand_short, cand_cur, cand_choice,
+                                                          delta, rem_w, completed)
+                            if _veto is not None:
+                                cand_choice, self._last_pick_note = cand_cur, _veto
                         if cand_choice == cand_cur:
                             may_escalate, esc_state = self._escalation_state(cand_short, cand_cur)
                             tried.append({"knob": cand_short, "verdict": "stay",
-                                          "escalation": esc_state})
+                                          "escalation": esc_state,
+                                          **({"pick": self._last_pick_note}
+                                             if self._last_pick_note else {})})
                             if short is None:      # remember the cheapest, for the log and the ack
                                 short, cur, choice, detail = (cand_short, cand_cur,
                                                               cand_choice, cand_detail)
@@ -2142,6 +2926,7 @@ class CoordinateBanditPlanner:
                                 # the log: a window where the dominant domain was comm, no knob
                                 # owned it, and the storage candidates were admitted instead.
                                 storage_suspect=storage_suspect,
+                                **self._decision_path(dom, storage_suspect, obs=obs),
                                 storage_headroom=suspect_reason,
                                 node_read_gbs=(round(suspect_bw, 4)
                                                if suspect_bw is not None else None),
@@ -2166,7 +2951,16 @@ class CoordinateBanditPlanner:
                                 self._reloc_pending_logged.pop(short, None)
                             _base_n, _base_mean = self._stats.get((short, cur), (0, 0.0))
                             self._move_from[short] = (cur, (delta_last or {}).get("delta"),
-                                                      completed, _base_mean)
+                                                      completed, _base_mean, choice)
+                            if str((delta_last or {}).get("source", "")).startswith(
+                                    "domain_exposed_recent_run"):
+                                self._move_base_walls[short] = list(self._epoch_wall_hist)[
+                                    -max(self._recent_run_n, self._min_samples):]
+                                self._move_base_tails[short] = list(self._epoch_tail_hist)[
+                                    -max(self._recent_run_n, self._min_samples):]
+                            else:
+                                self._move_base_walls.pop(short, None)
+                                self._move_base_tails.pop(short, None)
                     nxt = dict(cfg_now)
                     nxt[short] = choice
                     self._planned_cfg[w + 1] = dict(nxt)
@@ -2177,6 +2971,7 @@ class CoordinateBanditPlanner:
 
         self._cur_window = w
         self._win_metrics = {}
+        self._pending_finding = finding
         self._accumulate(finding)
         return plans
 
@@ -2248,6 +3043,10 @@ class CoordinateBanditPlanner:
                 requires_unanimity=bool(getattr(kd, "requires_unanimity", False)),
             ))
         return plans
+
+
+# Worker/thread-count knobs: moved geometrically (x2) in rate mode; see CoordinateBanditPlanner._next_up.
+_POOL_KNOBS = ("read_threads", "decode_threads", "num_workers", "computation_threads")
 
 
 def _num(v):
