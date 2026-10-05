@@ -2813,9 +2813,13 @@ class CoordinateBanditPlanner:
                             # unverified move is one change in flight, not a second one (halo regimes
                             # X, geometric steps: 1 -> 2 -> 4 must not wait for a verdict on 1 -> 2).
                             # The next verdict is then taken against the level it left.
+                            # Only once the move is APPLIED: with an applied-vector snapshot the physical value
+                            # must already be the new one (an unapplied plan is not a ramp).
                             _ramp = (_inflight == cand_short
                                      and cand_cur > self._move_from[cand_short][0]
-                                     and cand_choice > cand_cur)
+                                     and cand_choice > cand_cur
+                                     and (self._physical_latest_cfg is None
+                                          or self._physical_latest_cfg.get(cand_short) == cand_cur))
                             if _inflight is not None and not _ramp:
                                 cand_choice = cand_cur
                                 self._last_pick_note = "verdict_pending:%s" % _inflight
