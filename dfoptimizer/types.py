@@ -150,6 +150,11 @@ class KnobDef:
     # separated them, because it asked only how bad the SOURCE was.
     relocates_data: bool = False
 
+    # Optional geometric step factor for the planner's rate mode (a raise moves current x factor,
+    # capped at the declared maximum). None = the planner's default table (worker/thread counts x2,
+    # bucket_cap_mb x4) or, for other knobs, the grid neighbour.
+    step_factor: Optional[float] = None
+
     def cost_for(self, value=None) -> float:
         """Cost of moving this knob TO `value`.
 

@@ -25,6 +25,7 @@ def knob(
     requires_unanimity: bool = False,
     changes_regime: bool = False,
     relocates_data: bool = False,
+    step_factor: Optional[float] = None,
 ) -> dict:
     """Helper to declare a knob in @tunable.
 
@@ -49,6 +50,7 @@ def knob(
         "requires_unanimity": requires_unanimity,
         "changes_regime": changes_regime,
         "relocates_data": relocates_data,
+        "step_factor": step_factor,
     }
 
 
@@ -79,6 +81,7 @@ def knob_def_from_dict(knob_id: str, d: dict, target_function: str = "") -> Knob
         requires_unanimity=bool(d.get("requires_unanimity", False)),
         changes_regime=bool(d.get("changes_regime", False)),
         relocates_data=bool(d.get("relocates_data", False)),
+        step_factor=d.get("step_factor"),
         responds_to=responds_to,
         target_function=target_function,
     )
@@ -113,6 +116,7 @@ def knob_def_to_wire(kdef: KnobDef) -> dict:
         "requires_unanimity": kdef.requires_unanimity,
         "changes_regime": kdef.changes_regime,
         "relocates_data": kdef.relocates_data,
+        "step_factor": kdef.step_factor,
     }
 
 
@@ -146,6 +150,7 @@ def knob_def_from_wire(d: dict) -> KnobDef:
         requires_unanimity=bool(d.get("requires_unanimity", False)),
         changes_regime=bool(d.get("changes_regime", False)),
         relocates_data=bool(d.get("relocates_data", False)),
+        step_factor=d.get("step_factor"),
         responds_to=responds_to,
         target_function=d.get("target_function", ""),
     )

@@ -1833,8 +1833,11 @@ class CoordinateBanditPlanner:
             # Current value is off-grid (e.g. an app default between levels): snap to the nearest.
             i = min(range(len(levels)), key=lambda j: abs(_num(levels[j]) - _num(current)))
         out = [levels[i]]
-        if self._rate_mode and short in _POOL_KNOBS:
-            half = [v for v in levels if _num(v) < _num(levels[i]) and _num(v) <= _num(levels[i]) // 2]
+        factor = self._geo_factor(short)
+        if factor is not None:
+            half = [v for v in levels if _num(v) < _num(levels[i]) and _num(v) <= _num(levels[i]) / factor]
+            if not half and i > 0 and short not in _POOL_KNOBS:
+                half = [levels[i - 1]]      # a refinement level (e.g. 50) steps back to its grid neighbour
             if half:
                 out.append(max(half, key=_num))
             up = self._next_up(short, levels[i])
@@ -1847,21 +1850,36 @@ class CoordinateBanditPlanner:
             out.append(levels[i + 1])
         return out
 
+    def _geo_factor(self, short: str) -> Optional[float]:
+        """Geometric step factor of `short` in rate mode, or None for a plain grid-neighbour knob.
+
+        A KnobDef declares its own `step_factor`; otherwise the default table applies (worker/thread
+        counts x2, bucket_cap_mb x4, i.e. 25 -> 100 -> 400 on the 25/50/100/200/400 grid).
+        """
+        if not self._rate_mode:
+            return None
+        for kd in self.knobs.values():
+            if kd.id.split(".")[-1] == short and getattr(kd, "step_factor", None):
+                return float(kd.step_factor)
+        return _GEOMETRIC_FACTOR.get(short)
+
     def _next_up(self, short: str, current):
         """The next HIGHER level a raise of `short` proposes, or None at the declared maximum.
 
-        Worker/thread counts in rate mode move geometrically: current x2 (1->2->4->8), capped at the
-        declared maximum (the largest level not above x2 that is still above current). After an
-        observed revert the next raise from the restored level is one refinement step (+1, the next
+        Geometric knobs (see `_geo_factor`) move by their factor: current x2 for worker/thread
+        counts (1->2->4->8), x4 for bucket_cap_mb (25->100->400), capped at the declared maximum
+        (the largest level not above current x factor that is still above current). After an
+        observed revert the next raise from the restored level is one refinement step (the next
         level on the grid), then geometric again. Other knobs keep the grid neighbour.
         """
         levels = sorted(self._levels.get(short) or [current], key=_num)
         higher = [v for v in levels if _num(v) > _num(current)]
         if not higher:
             return None
-        if not (self._rate_mode and short in _POOL_KNOBS) or self._refine.get(short):
+        factor = self._geo_factor(short)
+        if factor is None or self._refine.get(short):
             return higher[0]
-        within = [v for v in higher if _num(v) <= 2 * _num(current)]
+        within = [v for v in higher if _num(v) <= factor * _num(current)]
         return max(within, key=_num) if within else higher[0]
 
     def _pick(self, short: str, current, domain: str, exposed_s: Optional[float] = None,
@@ -3051,6 +3069,9 @@ class CoordinateBanditPlanner:
 
 # Worker/thread-count knobs: moved geometrically (x2) in rate mode; see CoordinateBanditPlanner._next_up.
 _POOL_KNOBS = ("read_threads", "decode_threads", "num_workers", "computation_threads")
+# Geometric step factor per knob in rate mode (a KnobDef.step_factor overrides it). Pool counts double;
+# bucket_cap_mb quadruples so a DDP rebuild (seconds at 16N) is paid per 4x, not per 2x.
+_GEOMETRIC_FACTOR = {**{k: 2.0 for k in _POOL_KNOBS}, "bucket_cap_mb": 4.0}
 
 
 def _num(v):

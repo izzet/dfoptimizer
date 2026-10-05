@@ -68,3 +68,50 @@ def test_observed_decrease_sets_refinement_and_observed_raise_clears_it():
     metrics = dict(metrics, physical_read_threads=2, physical_applied_step=30, step_min=31)
     p._observed_cfg(6, metrics)
     assert p._refine["read_threads"] is False
+
+
+def _bucket_planner(**kw):
+    p = CoordinateBanditPlanner()
+    p.register_knobs({"stormer.bucket_cap_mb": KnobDef(id="stormer.bucket_cap_mb", default=25, type=int,
+                                                       values=[25, 50, 100, 200, 400], cost_seconds=15.0,
+                                                       target_function="stormer.train", **kw)})
+    p._rate_mode = True
+    p._min_samples = 3
+    return p
+
+
+def test_bucket_cap_moves_x4_capped_at_declared_max_then_refines_after_a_revert():
+    p = _bucket_planner()
+    assert [p._next_up("bucket_cap_mb", c) for c in (25, 50, 100, 200, 400)] == [100, 200, 400, 400, None]
+    p._refine["bucket_cap_mb"] = True                          # the 25 -> 100 move was reverted
+    assert p._next_up("bucket_cap_mb", 25) == 50               # one refinement step
+    p._refine["bucket_cap_mb"] = False
+    assert p._next_up("bucket_cap_mb", 50) == 200              # then geometric again
+    p._rate_mode = False
+    assert p._next_up("bucket_cap_mb", 25) == 50               # outside rate mode: grid neighbour
+
+
+def test_bucket_cap_neighbourhood_is_stay_previous_level_and_geometric_up():
+    p = _bucket_planner()
+    assert p._neighbourhood("bucket_cap_mb", 25) == [25, 100]
+    assert p._neighbourhood("bucket_cap_mb", 100) == [100, 25, 400]
+    assert p._neighbourhood("bucket_cap_mb", 400) == [400, 100]
+    assert p._neighbourhood("bucket_cap_mb", 50) == [50, 25, 200]    # refinement level steps back one grid level
+    p._rate_mode = False
+    assert p._neighbourhood("bucket_cap_mb", 100) == [100, 50, 200]
+
+
+def test_declared_step_factor_overrides_the_default_and_round_trips_on_the_wire():
+    from dfoptimizer.runtime.knob import knob_def_from_wire, knob_def_to_wire
+    p = _bucket_planner(step_factor=2.0)
+    assert [p._next_up("bucket_cap_mb", c) for c in (25, 50, 100)] == [50, 100, 200]
+    assert knob_def_from_wire(knob_def_to_wire(p.knobs["stormer.bucket_cap_mb"])).step_factor == 2.0
+    assert _bucket_planner().knobs["stormer.bucket_cap_mb"].step_factor is None
+
+
+def test_predicted_effect_for_bucket_cap_uses_the_geometric_next_level():
+    p = _bucket_planner()
+    p._epoch_windows = 20
+    p._epoch_dom["comm"] = deque([0.0] * 15 + [0.15, 0.16, 0.15, 0.15, 0.15])
+    delta, src = p.predicted_effect("bucket_cap_mb", "comm")
+    assert delta is not None and abs(delta - 0.15 * (1 - 25 / 100)) < 1e-12 and "25.0->100" in src
