@@ -144,6 +144,7 @@ class Window:
         # exposure the planner verifies a move on. `_step_exp_cur` collects the step in progress.
         self._window_step_exp = {}
         self._step_exp_cur = {}
+        self._window_extra = {}
         self._target_s = window_target_seconds()
         self._telemetry = os.environ.get("LIVEFLOW_NODE_TELEMETRY", "1") != "0"
         # Stall an apply caused, as training saw it: the wall of the first step after the apply
@@ -239,6 +240,12 @@ class Window:
                 if value is not None and value == value:
                     self._step_exp_cur[family] = max(float(value), 0.0)
 
+    def set_window_series(self, name: str, values) -> None:
+        """Attach a whole-window per-step series computed at the window close (e.g. the job-wide per-step maximum
+        input wait every rank holds after the window's Allreduce(MAX)); carried only when it covers every step."""
+        if self._liveflow_v1:
+            self._window_extra[name] = [max(float(v), 0.0) for v in values]
+
     def _series_args(self):
         """string_args carrying the window's per-step series (see step_series.py), or nothing."""
         if not (self._liveflow_v1 and self._window_step_walls):
@@ -246,6 +253,9 @@ class Window:
         n = len(self._window_step_walls)
         series = {"wall": list(self._window_step_walls)}
         for family, values in self._window_step_exp.items():
+            if len(values) == n:
+                series[family] = list(values)
+        for family, values in self._window_extra.items():
             if len(values) == n:
                 series[family] = list(values)
         text = step_series.encode(self._completed_steps - n + 1, series)
@@ -366,6 +376,7 @@ class Window:
         self._physical_window = dict(self._physical_current)
         self._window_step_walls = []
         self._window_step_exp = {}
+        self._window_extra = {}
         # This is a boundary — emit window.start
         self._window_index += 1
         self._active = True

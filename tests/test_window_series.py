@@ -110,3 +110,28 @@ def test_series_off_outside_liveflow_v1(env):
         w.note_step_exposure(storage=0.5)
         w.stop()
     assert all("string_args" not in e or not e["string_args"] for e in dft.events if e["name"] == "window.stop")
+
+
+def test_a_whole_window_series_set_at_the_close_rides_with_the_per_step_series(env):
+    clock = {"t": 0.0}
+    env.setattr(window_mod.time, "perf_counter", lambda: clock["t"])
+    dft = FakeDft()
+    w = Window(dft)
+    w.set_horizon(2, 20)
+    w.set_epoch(1)
+    for i in range(20):
+        w.start()
+        clock["t"] += 0.1
+        w.note_step_exposure(storage=0.01)
+        if i == 19:                                          # the job-wide per-step maximum is known only at the close
+            w.set_window_series("job_input", [0.02 * (j % 2) for j in range(20)])
+        w.stop()
+    ss = step_series.decode([e for e in dft.events if e["name"] == "window.stop"][0]["string_args"]["step_series"][1])
+    assert ss.series["job_input"][:3] == pytest.approx([0.0, 0.02, 0.0], abs=1e-5)
+    assert ss.series["storage"] == pytest.approx([0.01] * 20, abs=1e-5)
+    w2 = Window(FakeDft())
+    w2.start()
+    w2.set_window_series("job_input", [1.0])                 # a series that does not cover the window is not carried
+    clock["t"] += 0.1
+    assert "job_input" not in (step_series.decode(w2._series_args().get("step_series", (0, ""))[1] or "") or
+                                type("x", (), {"series": {}})()).series

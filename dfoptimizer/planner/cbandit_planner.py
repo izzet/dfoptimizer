@@ -672,7 +672,7 @@ class CoordinateBanditPlanner(StepVerifyMixin):
             return None
         for short, entry in self._move_from.items():
             if entry[1] and entry[1] > 0:
-                if self._verify == "per_step" and self._sv_mechanism_confirmed(short, entry):
+                if self._sv_active() and self._sv_mechanism_confirmed(short, entry):
                     continue     # it did what it targeted; only its net step-time verdict is still being collected
                 return short
         return None
@@ -766,7 +766,7 @@ class CoordinateBanditPlanner(StepVerifyMixin):
                         if _was is not None:
                             self._refine[short] = cfg[short] < _was
                         self._physical_change_old[(short, step)] = _was
-                        if self._verify == "per_step":
+                        if self._sv_active():
                             # Per-step verdicts, not pooled arms, are the evidence about an interacting
                             # configuration: every other knob's arm samples (keyed by that knob's value alone)
                             # now mix configurations that no longer run (halo M: read and decode threads interact).
@@ -1212,7 +1212,7 @@ class CoordinateBanditPlanner(StepVerifyMixin):
                 _chg = [c for c in (self._physical_changes if self._physical_latest_cfg is not None
                                     else []) if c[0] == short]
                 if _chg:
-                    _sv = self._sv_verdict(short, old_value, cur, int(_chg[-1][2]), window)
+                    _sv = self._sv_verdict(short, old_value, cur, int(_chg[-1][2]), window, delta)
                     if _sv == "confirm":
                         _rec = self._sv_last.get(short, {})
                         logger.info("optimizer.cbandit.move_confirmed", window=window, knob=short, value=cur,
@@ -1678,7 +1678,7 @@ class CoordinateBanditPlanner(StepVerifyMixin):
         which is the whole point: `neighbourhood_exhausted_no_help` may not be declared from a
         sample that could not have contained the cost (4s.17).
         """
-        if self._rate_mode and self._verify == "per_step" and short is not None and delta:
+        if self._sv_active() and short is not None and delta:
             got = self._sv_required_steps(short, float(delta), remaining)
             if got is not None:
                 need_steps, swhy = got
@@ -1949,7 +1949,7 @@ class CoordinateBanditPlanner(StepVerifyMixin):
         horizon is not payable. COST_W=0 removes the cost and payback terms for the ablation.
         """
         cands = self._neighbourhood(short, current)
-        if self._verify == "per_step" and self._rate_mode and short not in self._relocating:
+        if self._sv_active() and short not in self._relocating:
             # A move targets one family's exposure and relieves it by RAISING the resource; lowering is
             # reached only by a verdict (revert) or the measured-capacity path, never by exploration.
             cands = [lv for lv in cands if lv == current or _num(lv) > _num(current)]
@@ -2299,7 +2299,7 @@ class CoordinateBanditPlanner(StepVerifyMixin):
                 pass
         if not alts:
             return True, "neighbourhood_exhausted"
-        if self._rate_mode and self._verify == "per_step":
+        if self._sv_active():
             got = self._sv_escalation_state(short, current, alts)
             if got is not None:
                 return got
@@ -2905,7 +2905,7 @@ class CoordinateBanditPlanner(StepVerifyMixin):
                             # The next verdict is then taken against the level it left.
                             # Only once the move is APPLIED: with an applied-vector snapshot the physical value
                             # must already be the new one (an unapplied plan is not a ramp).
-                            _ramp = (_inflight == cand_short
+                            _ramp = (_inflight == cand_short and not self._sv_active()
                                      and cand_cur > self._move_from[cand_short][0]
                                      and cand_choice > cand_cur
                                      and (self._physical_latest_cfg is None
@@ -2916,7 +2916,7 @@ class CoordinateBanditPlanner(StepVerifyMixin):
                         if cand_choice != cand_cur:
                             _veto = self._apply_cost_veto(cand_short, cand_cur, cand_choice,
                                                           delta, rem_w, completed)
-                            if _veto is None and self._verify == "per_step" and self._rate_mode:
+                            if _veto is None and self._sv_active():
                                 _veto = (self._sv_refuted(cand_short, cand_cur, cand_choice, delta)
                                          or self._sv_gate(cand_short, cand_cur, cand_choice, delta, rem_w,
                                                           self._measured_apply_cost(cand_short, cand_cur,

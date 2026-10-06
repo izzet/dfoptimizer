@@ -83,6 +83,10 @@ class StepVerifyMixin:
     def _sv_enabled(self) -> bool:
         return self._verify == "per_step" and bool(self._tl)
 
+    def _sv_active(self) -> bool:
+        """The per-step path governs this decision: selected, rate mode (liveflow-v1), and the window records carry series."""
+        return self._rate_mode and self._sv_enabled()
+
     # ------------------------------------------------------------------ segments
     def _sv_key(self, short: str, ss: Optional[step_series.StepSeries] = None) -> Optional[str]:
         """The series that carries the targeted family's per-step exposure."""
@@ -157,8 +161,18 @@ class StepVerifyMixin:
         return need, why
 
     # ------------------------------------------------------------------ verification
-    def _sv_verdict(self, short: str, old_value, cur, change_step: int, window: int) -> Optional[str]:
-        """'confirm' | 'revert' | 'collect' for an applied move, or None when per-step data cannot judge it."""
+    def _sv_verdict(self, short: str, old_value, cur, change_step: int, window: int,
+                    delta: Optional[float] = None) -> Optional[str]:
+        """'confirm' | 'revert' | 'collect' for an applied move, or None when per-step data cannot judge it.
+
+        confirm   the step-time interval excludes zero on the improving side
+        revert    the step-time interval excludes zero on the worsening side; or the targeted exposure itself rose
+                  (interval excludes zero); or FUTILE: the steps collected reach what the predicted effect needed
+                  (power rule, below) and the targeted exposure has still not fallen with an interval that excludes
+                  zero, i.e. the move delivered no detectable part of the effect that justified it
+        collect   otherwise; collection is bounded by the horizon (admission already required the needed steps
+                  to fit in it)
+        """
         if not self._sv_enabled():
             return None
         key = self._sv_key(short)
@@ -176,23 +190,53 @@ class StepVerifyMixin:
         wall_ci = sv.diff_ci(wall_pre, wall_post, w_pre, w_post)
         exp_ci = sv.diff_ci(exp_pre, exp_post, wx_pre, wx_post) if len(exp_pre) and len(exp_post) else None
         verdict = sv.verdict(wall_ci, self._min_samples)
+        reason = verdict
+        n_post = int(w_post.sum())
+        if verdict == "collect" and exp_ci is not None:
+            if exp_ci["n_after"] >= max(self._min_samples, 2 * exp_ci["L_after"]) and exp_ci["lo"] > 0.0:
+                verdict, reason = "revert", "own_exposure_rose"
+            elif exp_ci["hi"] >= 0.0 and delta:
+                need = self._sv_futility_steps(exp_pre, wx_pre, float(delta), old_value, cur)
+                # never before one full window of post-apply steps (the unit the planner decides in)
+                if need is not None and n_post >= max(need, int(self._control_steps)):
+                    verdict, reason = "revert", "futile:no_detectable_effect_after_%d_steps" % need
         rec = {"window": window, "knob": short, "from": old_value, "to": cur, "applied_step": change_step,
                "pre_steps": [prev + 1, change_step], "post_until": None if nxt == float("inf") else nxt,
-               "target_series": key, "step_ci": wall_ci, "exposure_ci": exp_ci, "verdict": verdict,
-               "n_post": int(w_post.sum()), "n_pre": int(w_pre.sum())}
+               "target_series": key, "step_ci": wall_ci, "exposure_ci": exp_ci, "verdict": verdict, "reason": reason,
+               "n_post": n_post, "n_pre": int(w_pre.sum())}
         self._sv_last[short] = rec
         logger.info("optimizer.cbandit.step_verify", **{k: (_clean(v)) for k, v in rec.items()})
-        if verdict in ("confirm", "revert"):
+        if verdict in ("confirm", "revert") and reason in ("confirm", "revert", "own_exposure_rose") or verdict == "confirm":
             others = self._sv_others(short)
             better = verdict == "confirm"
             self._tried[(short, old_value, cur, others)] = "better" if better else "worse"
             self._tried[(short, cur, old_value, others)] = "worse" if better else "better"
+        elif verdict == "revert":                      # futile: measured no better (not worse): still not worth the resource
+            others = self._sv_others(short)
+            self._tried[(short, old_value, cur, others)] = "worse"
         if verdict == "revert" and exp_pre.size:
             lb = sv.mean_lower_bound(exp_pre, wx_pre)
             hi = float(np.quantile(sv.mbb_means(exp_pre, wx_pre, sv.block_length(exp_pre)[0],
                                                 np.random.default_rng(sv.SEED)), 0.975))
             self._refuted[(short, old_value, cur, self._sv_others(short))] = {"lo": lb, "hi": hi, "window": window}
         return verdict
+
+    def _sv_futility_steps(self, exp_pre, wx_pre, delta: float, old_value, cur) -> Optional[int]:
+        """Steps needed to detect the smallest effect this move was admitted on, at the planner's alpha and power.
+
+        The predicted effect is the whole exposure a raise could recover; a raise from `old` to `new` of a pool
+        recovers at most the share 1 - old/new of it (overlap form), which is the effect the move must deliver at
+        least in part. n = blocks x L with blocks = (z sigma / delta_min)^2, sigma and L of the PRE exposure series.
+        """
+        old_f, new_f = _f(old_value), _f(cur)
+        share = (1.0 - old_f / new_f) if (old_f > 0.0 and new_f > old_f) else 1.0
+        dmin = delta * share
+        if dmin <= 0.0 or len(exp_pre) < 2:
+            return None
+        L, sigma = sv.effective_blocks(exp_pre)
+        z = self._z(1.0 - self._alpha / 2.0) + self._z(self._power)
+        blocks = int(math.ceil((z * sigma / dmin) ** 2)) if sigma > 0 else 1
+        return max(blocks * L, self._min_samples, 2 * L)
 
     def _sv_escalation_state(self, short: str, current, alts: list) -> Optional[Tuple[bool, str]]:
         """May a costlier actuator pass this coordinate? Decided on MEASURED verdicts of this configuration.

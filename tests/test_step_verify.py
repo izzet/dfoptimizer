@@ -183,11 +183,50 @@ def test_per_step_reverts_a_slower_move():
     assert p._unconfirmed_move(4, 3000.0) == ("decode_threads", 1)
 
 
-def test_per_step_keeps_collecting_when_the_interval_straddles_zero():
+def _feed_exposure(p, rng, pre_exp, post_exp, n_post, wall_sigma=0.03, applied=200, exp_sigma=0.002):
+    """Step time pure noise around 0.1 s; the targeted (decode) exposure moves from pre_exp to post_exp."""
+    steps = list(range(6, applied + 1)) + list(range(applied + 1, applied + 1 + n_post))
+    wall = 0.100 + rng.normal(0, wall_sigma, len(steps))
+    exp = np.array([pre_exp if s_ <= applied else post_exp for s_ in steps]) + rng.normal(0, exp_sigma, len(steps))
+    for i in range(0, len(steps), 100):
+        ss = step_series.decode(step_series.encode(steps[i], {"wall": wall[i:i + 100].tolist(),
+                                                              "decode": np.maximum(exp[i:i + 100], 0).tolist()}))
+        ss.window = i // 100 + 1
+        p._tl.append(ss)
+    p._physical_latest_cfg = {"decode_threads": 2}
+    p._physical_changes = [("decode_threads", 2, applied)]
+    p._move_from["decode_threads"] = (1, 0.04, 1, 0.1, 2)
+    p.current_values["halo3d.decode_threads"] = 2
+
+
+def test_per_step_keeps_collecting_when_the_exposure_fell_but_the_step_time_is_still_noisy():
     p = _planner("per_step")
-    _feed(p, np.random.default_rng(2), 0.100, 0.100, 150, sigma=0.03)
+    _feed_exposure(p, np.random.default_rng(2), 0.040, 0.020, 150)
     assert p._unconfirmed_move(4, 3000.0) is None
-    assert "decode_threads" in p._move_from and p._sv_last["decode_threads"]["verdict"] == "collect"
+    rec = p._sv_last["decode_threads"]
+    assert "decode_threads" in p._move_from and rec["verdict"] == "collect" and rec["exposure_ci"]["hi"] < 0
+    assert p._sv_mechanism_confirmed("decode_threads", p._move_from["decode_threads"])    # no longer blocks other families
+
+
+def test_per_step_reverts_a_futile_move_only_once_the_steps_its_prediction_needed_have_been_collected():
+    p = _planner("per_step")
+    p._control_steps = 100                                                                   # K: one window = 100 steps
+    _feed_exposure(p, np.random.default_rng(3), 0.040, 0.040, 60, exp_sigma=0.01)          # less than one window since the apply
+    assert p._unconfirmed_move(4, 3000.0) is None and p._sv_last["decode_threads"]["verdict"] == "collect"
+    q = _planner("per_step")
+    q._control_steps = 100
+    _feed_exposure(q, np.random.default_rng(3), 0.040, 0.040, 600, exp_sigma=0.01)          # plenty: no effect on the target
+    assert q._unconfirmed_move(9, 3000.0) == ("decode_threads", 1)
+    rec = q._sv_last["decode_threads"]
+    assert rec["verdict"] == "revert" and rec["reason"].startswith("futile")
+    assert ("decode_threads", 1, 2, q._sv_others("decode_threads")) in q._refuted
+
+
+def test_per_step_reverts_a_move_that_raised_its_own_exposure():
+    p = _planner("per_step")
+    _feed_exposure(p, np.random.default_rng(4), 0.040, 0.060, 150)
+    assert p._unconfirmed_move(4, 3000.0) == ("decode_threads", 1)
+    assert p._sv_last["decode_threads"]["reason"] == "own_exposure_rose"
 
 
 def test_window_mean_mode_ignores_the_series():
@@ -216,6 +255,7 @@ def test_predicted_effect_and_required_steps_come_from_the_series():
 # ------------------------------------------------------------------ per-step planner policy
 def test_exploration_only_raises_the_resource_in_per_step_mode():
     p = _planner("per_step")
+    p._tl.append(step_series.decode(step_series.encode(1, {"wall": [0.1] * 10})))                # series present: per-step path
     p.current_values["halo3d.decode_threads"] = 2
     p._levels["decode_threads"] = [1, 2, 3, 4, 5, 6, 7, 8]
     choice, detail = p._pick("decode_threads", 2, "decode", exposed_s=0.08, remaining=3000.0)
@@ -228,10 +268,11 @@ def test_exploration_only_raises_the_resource_in_per_step_mode():
 
 def test_a_move_whose_own_exposure_fell_no_longer_blocks_other_moves():
     p = _planner("per_step")
-    _feed(p, np.random.default_rng(3), 0.100, 0.100, 150, sigma=0.05)   # step time noisy: verdict stays collect
+    _feed(p, np.random.default_rng(3), 0.100, 0.100, 150, sigma=0.05)
     p._sv_last.clear()
-    assert p._unconfirmed_move(4, 3000.0) is None and p._inflight_move() == "decode_threads"
-    p._sv_last["decode_threads"]["exposure_ci"] = {"hi": -0.01}          # its own exposure fell, interval excludes zero
+    p._move_from["decode_threads"] = (1, 0.04, 1, 0.1, 2)
+    assert p._inflight_move() == "decode_threads"
+    p._sv_last["decode_threads"] = {"to": 2, "verdict": "collect", "exposure_ci": {"hi": -0.01}}   # its own exposure fell
     assert p._inflight_move() is None
     p._sv_last["decode_threads"]["exposure_ci"] = {"hi": 0.002}
     assert p._inflight_move() == "decode_threads"
