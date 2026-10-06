@@ -215,6 +215,20 @@ class StepVerifyMixin:
                 return False, "helpful_neighbour:%s" % lv
         return True, "neighbourhood_exhausted_no_help"
 
+    def _sv_mechanism_confirmed(self, short: str, entry) -> bool:
+        """The move's own targeted exposure fell, with a 95% interval that excludes zero, since its apply.
+
+        The net step-time verdict can stay `collect` for a long time when the step carries noise from other
+        families (an epoch-start loader stall is several times the effect of a comm move). Such a move no
+        longer blocks moves of other knobs: it is verified (and, if the step time ends worse, reverted) in
+        parallel, and a later move is verified against the segment after it.
+        """
+        rec = self._sv_last.get(short)
+        if rec is None or len(entry) < 5 or rec.get("to") != entry[4]:
+            return False
+        ci = rec.get("exposure_ci")
+        return bool(ci) and ci["hi"] < 0.0 and rec["verdict"] != "revert"
+
     def _sv_others(self, short: str) -> tuple:
         """The rest of the configuration: a refutation holds only while the other knobs are as they were."""
         cfg = self._physical_latest_cfg or self._short_cfg()

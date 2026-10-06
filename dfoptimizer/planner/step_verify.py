@@ -12,6 +12,9 @@ THE BLOCK RULE (stated, one rule, no per-workload tuning).  For a segment of n s
 i.e. L is the width of the central run of lags whose autocorrelation is still at least 1/e (white
 noise: k = 1, L = 1, the ordinary bootstrap; a constant series: L = 1; the sqrt(n) cap applies when the
 autocorrelation never decays below 1/e within sqrt(n) lags, a strongly persistent or trending segment).
+One more case: when, after that first drop, the autocorrelation returns to at least 1/e at a local peak P with
+at least three periods in the segment (P <= n/3: an epoch-start stall or a validation gap that recurs), L = P, so
+each block holds a whole period and every resample holds as many such events as the data do.
 Simulated coverage of the 95% interval (AR(1), 300 steps per segment): 0.95 (phi 0), 0.90 (0.5),
 0.88 (0.7), 0.85 (0.9): the e-folding lag alone (L = k) covered 0.86 / 0.84 / 0.78.  A resample draws ceil(n / L)
 blocks of L consecutive steps uniformly with replacement (overlapping blocks) and takes the mean;
@@ -63,13 +66,20 @@ def block_length(x: np.ndarray) -> Tuple[int, str]:
     if n < 2:
         return 1, "n<2"
     cap = int(math.ceil(math.sqrt(n)))
-    r = acf(x, min(cap, n - 1))
-    if not np.any(r[1:]) :
+    r = acf(x, min(max(cap, n // 3) + 1, n - 1))
+    if not np.any(r[1:]):
         return 1, "constant"
-    for k in range(1, len(r)):
-        if r[k] < _E_INV:
-            return max(1, min(2 * k - 1, cap)), "acf<1/e@%d" % k
-    return cap, "sqrt(n)"
+    k = next((i for i in range(1, min(cap, len(r) - 1) + 1) if r[i] < _E_INV), None)
+    if k is None:
+        return cap, "sqrt(n)"
+    L, rule = max(1, min(2 * k - 1, cap)), "acf<1/e@%d" % k
+    # A periodic structure (an epoch-start stall, a validation gap): after the first drop the autocorrelation
+    # returns to >= 1/e at a local peak P with at least three periods in the segment. A block of one period then
+    # holds the same number of such events in every resample, as the data do.
+    for p in range(k + 1, min(n // 3, len(r) - 2) + 1):
+        if r[p] >= _E_INV and r[p] >= r[p - 1] and r[p] >= r[p + 1]:
+            return p, "period@%d" % p
+    return L, rule
 
 
 # ----------------------------------------------------------------------------------------------

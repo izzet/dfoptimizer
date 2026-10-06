@@ -33,6 +33,22 @@ def test_block_length_rule():
     assert sv.block_length(np.array([1.0]))[0] == 1
 
 
+def test_periodic_spikes_get_a_block_of_one_period_and_a_tight_interval():
+    rng = np.random.default_rng(2)
+    def epochs(n_epochs, spike):
+        x = rng.normal(0.20, 0.01, 47 * n_epochs)
+        x[::47] += spike                                         # one loader-restart stall per epoch
+        return x
+    pre, post = epochs(3, 1.1), epochs(5, 3.5)
+    assert sv.block_length(pre) == (47, "period@47") and sv.block_length(post)[0] == 47
+    ci = sv.diff_ci(pre, post)
+    # the stall rose by 2.4 s per epoch = +51 ms/step; whole-period blocks make that significant after five epochs,
+    # where an iid bootstrap (spike count random in every resample) could not separate it from zero
+    assert ci["lo"] > 0 and ci["est"] == pytest.approx(0.051, abs=0.006)
+    iid = sv.diff_ci(pre, post, B=2000)
+    assert (ci["hi"] - ci["lo"]) < 0.3 * 0.1                    # tight
+
+
 # ------------------------------------------------------------------ interval calibration
 def _coverage(phi, shift, trials, n=300, B=400):
     rng = np.random.default_rng(7)
@@ -195,3 +211,66 @@ def test_predicted_effect_and_required_steps_come_from_the_series():
     assert small["n_required_steps"] > 10 * why["n_required_steps"]               # smaller effect, many more steps
     huge, why2 = p.required_dwell(50.0, short="decode_threads", value=1, delta=1e-5)
     assert why2["reachable"] is False                                           # unreachable inside 50 steps
+
+
+# ------------------------------------------------------------------ per-step planner policy
+def test_exploration_only_raises_the_resource_in_per_step_mode():
+    p = _planner("per_step")
+    p.current_values["halo3d.decode_threads"] = 2
+    p._levels["decode_threads"] = [1, 2, 3, 4, 5, 6, 7, 8]
+    choice, detail = p._pick("decode_threads", 2, "decode", exposed_s=0.08, remaining=3000.0)
+    assert {d["level"] for d in detail} <= {2, 4}                       # no level below the current one is a candidate
+    w = _planner("window_mean")
+    w.current_values["halo3d.decode_threads"] = 2
+    w._levels["decode_threads"] = [1, 2, 3, 4, 5, 6, 7, 8]
+    assert 1 in {d["level"] for d in w._pick("decode_threads", 2, "decode", exposed_s=0.08, remaining=3000.0)[1]}
+
+
+def test_a_move_whose_own_exposure_fell_no_longer_blocks_other_moves():
+    p = _planner("per_step")
+    _feed(p, np.random.default_rng(3), 0.100, 0.100, 150, sigma=0.05)   # step time noisy: verdict stays collect
+    p._sv_last.clear()
+    assert p._unconfirmed_move(4, 3000.0) is None and p._inflight_move() == "decode_threads"
+    p._sv_last["decode_threads"]["exposure_ci"] = {"hi": -0.01}          # its own exposure fell, interval excludes zero
+    assert p._inflight_move() is None
+    p._sv_last["decode_threads"]["exposure_ci"] = {"hi": 0.002}
+    assert p._inflight_move() == "decode_threads"
+
+
+def test_escalation_follows_measured_verdicts_of_this_configuration_only():
+    p = _planner("per_step")
+    p._tl.append(step_series.decode(step_series.encode(1, {"wall": [0.1] * 10})))        # enable the per-step path
+    cur = 2
+    alts = [1, 4]
+    assert p._sv_escalation_state("decode_threads", cur, alts) == (False, "untried_neighbour:4")   # raises only; 4 untried
+    others = p._sv_others("decode_threads")
+    p._tried[("decode_threads", 2, 4, others)] = "worse"
+    assert p._sv_escalation_state("decode_threads", cur, alts) == (True, "neighbourhood_exhausted_no_help")
+    p._tried[("decode_threads", 2, 4, others)] = "better"
+    assert p._sv_escalation_state("decode_threads", cur, alts) == (False, "helpful_neighbour:4")
+    p._physical_latest_cfg = {"decode_threads": 2, "read_threads": 3}                       # another knob moved: not evidence now
+    assert p._sv_escalation_state("decode_threads", cur, alts) == (False, "untried_neighbour:4")
+
+
+def test_a_refuted_move_stays_refuted_until_the_targeted_exposure_rises_above_the_refuted_interval():
+    p = _planner("per_step")
+    p._refuted[("decode_threads", 2, 4, p._sv_others("decode_threads"))] = {"lo": 0.03, "hi": 0.05, "window": 9}
+    assert "refuted" in p._sv_refuted("decode_threads", 2, 4, 0.04)
+    assert p._sv_refuted("decode_threads", 2, 4, 0.06) is None             # exposure rose above the interval: re-admitted
+    assert ("decode_threads", 2, 4, p._sv_others("decode_threads")) not in p._refuted
+    p._refuted[("decode_threads", 2, 4, p._sv_others("decode_threads"))] = {"lo": 0.03, "hi": 0.05, "window": 9}
+    p._physical_latest_cfg = {"decode_threads": 2, "read_threads": 3}      # configuration differs: refutation does not apply
+    assert p._sv_refuted("decode_threads", 2, 4, 0.04) is None
+
+
+def test_side_effect_ledger_blocks_the_next_move_of_the_same_knob():
+    p = _planner("per_step")
+    p._side["decode_threads"] = sv.SideCost(one_time_s=2.0, apply_s=0.2, rate_s_per_step=0.004, rss_kb=1e6, unit=1.0)
+    p._tele[7] = {"avail_kb": 5e8, "anon_kb": None, "reclaim": 0.0}
+    assert p._sv_gate("decode_threads", 2, 4, 0.01, 5000, 0.2) is None                       # 0.006*5000 = 30 s >> 2.4 s
+    assert "gain" in p._sv_gate("decode_threads", 2, 4, 0.01, 300, 0.2)                      # 1.8 s < 0.2 + 4.0 s
+    assert "rate" in p._sv_gate("decode_threads", 2, 3, 0.003, 5000, 0.2)                    # recurring 0.004/step eats 0.003
+    assert p._sv_gate("read_threads", 2, 4, 0.01, 10, 0.2) is None                           # a knob with no measurement
+    w = _planner("window_mean")
+    w._side["decode_threads"] = p._side["decode_threads"]
+    assert w._sv_gate("decode_threads", 2, 4, 0.0001, 10, 0.2) is None                       # old mode never prices side effects

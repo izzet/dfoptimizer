@@ -672,6 +672,8 @@ class CoordinateBanditPlanner(StepVerifyMixin):
             return None
         for short, entry in self._move_from.items():
             if entry[1] and entry[1] > 0:
+                if self._verify == "per_step" and self._sv_mechanism_confirmed(short, entry):
+                    continue     # it did what it targeted; only its net step-time verdict is still being collected
                 return short
         return None
 
