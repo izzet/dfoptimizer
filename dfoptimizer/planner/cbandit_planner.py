@@ -2231,6 +2231,16 @@ class CoordinateBanditPlanner:
         if self._cost_w == 0.0:
             return True, "cost_weighting_disabled"
         alts = [lv for lv in self._neighbourhood(short, current) if lv != current]
+        if self._strict_explore and short in self._shipped and short not in self._relocating:
+            # A neighbour below the shipped value is never explored (`_pick`, A2(2)), so it can never be
+            # sampled: requiring it made `untried_neighbour:<below shipped>` permanent and a cheaper coordinate
+            # that had been tried and refused (prefetch_size 2 -> 4 reverted) could never hand over to the
+            # next knob of the domain (job-level TF run: read_threads was reached in 1 of 3 runs, 47 windows in).
+            try:
+                floor = _num(self._shipped[short])
+                alts = [lv for lv in alts if _num(lv) >= floor]
+            except (TypeError, ValueError):
+                pass
         if not alts:
             return True, "neighbourhood_exhausted"
         # THE SAMPLE MUST BE ABLE TO CONTAIN THE COST, not merely reach min_samples.
