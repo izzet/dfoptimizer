@@ -32,6 +32,8 @@ import statistics
 import time
 from typing import Any, Dict, Optional
 
+from .. import step_series
+
 logger = logging.getLogger(__name__)
 
 # DFTracer tag helpers — match TagValue.value() format:
@@ -39,6 +41,65 @@ logger = logging.getLogger(__name__)
 # C++ reads std::get<0> as tag_type, std::get<1> as value
 # tag_type 0 = KEY (included in output)
 _INT_TAG = lambda v: (0, v)   # (tag_type=KEY, value)
+_STR_TAG = lambda v: (0, v)
+
+# Window sizing (liveflow-v1): the window is K = max(20, ceil(T / median step)) steps, frozen after the
+# first 20 steps, where T is the target window duration in seconds. T is one stated parameter of the
+# mechanism (default 30 s, the value every campaign so far ran); LIVEFLOW_WINDOW_TARGET_S overrides it
+# for the window-target ablation (e.g. 10 and 60).
+WINDOW_TARGET_ENV = "LIVEFLOW_WINDOW_TARGET_S"
+WINDOW_TARGET_DEFAULT_S = 30.0
+
+
+def window_target_seconds() -> float:
+    raw = os.environ.get(WINDOW_TARGET_ENV, "")
+    if not raw.strip():
+        return WINDOW_TARGET_DEFAULT_S
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ValueError("%s must be a positive number of seconds, got %r" % (WINDOW_TARGET_ENV, raw))
+    if not (value > 0.0 and value == value and value != float("inf")):
+        raise ValueError("%s must be a positive number of seconds, got %r" % (WINDOW_TARGET_ENV, raw))
+    return value
+
+
+def freeze_window_steps(median_step_seconds: float, target_seconds: Optional[float] = None) -> int:
+    """K = max(20, ceil(T / median step))."""
+    target = window_target_seconds() if target_seconds is None else float(target_seconds)
+    return max(20, math.ceil(target / median_step_seconds))
+
+
+def read_node_telemetry() -> Dict[str, int]:
+    """Node-wide memory-pressure counters, cumulative since boot (vmstat) and the current levels (meminfo).
+
+    allocstall* and pgscan_direct* count direct reclaim (an allocation that had to scan for memory),
+    compact_stall counts allocation-time compaction; AnonPages is the node's anonymous resident memory
+    (the ranks, loader workers and prefetch queues), MemAvailable what the kernel can still hand out. The
+    planner prices a move's side effects from their window-to-window change. Empty when /proc is unreadable.
+    """
+    out: Dict[str, int] = {}
+    try:
+        stall = scan = compact = 0
+        with open("/proc/vmstat") as f:
+            for line in f:
+                name, _, value = line.partition(" ")
+                if name.startswith("allocstall"):
+                    stall += int(value)
+                elif name.startswith("pgscan_direct"):
+                    scan += int(value)
+                elif name == "compact_stall":
+                    compact += int(value)
+        out.update(vm_allocstall=stall, vm_pgscan_direct=scan, vm_compact_stall=compact)
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("AnonPages:"):
+                    out["mem_anon_kb"] = int(line.split()[1])
+                elif line.startswith("MemAvailable:"):
+                    out["mem_avail_kb"] = int(line.split()[1])
+    except (OSError, ValueError):
+        return {}
+    return out
 
 
 class Window:
@@ -79,6 +140,12 @@ class Window:
         # input-stall steps, so a worker change can halve the steps over 1 s and leave the window
         # mean unchanged (stormer-v1-smoke attempt2).
         self._window_step_walls = []
+        # Per-step exposed wait of each family the application measures (liveflow-v1): the targeted
+        # exposure the planner verifies a move on. `_step_exp_cur` collects the step in progress.
+        self._window_step_exp = {}
+        self._step_exp_cur = {}
+        self._target_s = window_target_seconds()
+        self._telemetry = os.environ.get("LIVEFLOW_NODE_TELEMETRY", "1") != "0"
         # Stall an apply caused, as training saw it: the wall of the first step after the apply
         # against the median step of the window before (see begin_apply_probe).
         self._apply_probe = None
@@ -156,7 +223,33 @@ class Window:
         """The window's tail metric, or nothing: p90 of the per-step wall in microseconds."""
         if not (self._liveflow_v1 and self._window_step_walls):
             return {}
-        return {"step_wall_p90_us": _INT_TAG(int(round(self._p90(self._window_step_walls) * 1e6)))}
+        out = {"step_wall_p90_us": _INT_TAG(int(round(self._p90(self._window_step_walls) * 1e6)))}
+        if self._telemetry:
+            out.update({k: _INT_TAG(v) for k, v in read_node_telemetry().items()})
+        return out
+
+    def note_step_exposure(self, **seconds) -> None:
+        """Record this step's exposed wait per family, in seconds (storage, decode, delivery, comm, job_input).
+
+        Called by the application once per step, before `stop()`. Families the application never notes are
+        simply absent from the window's series; a family noted in some steps counts as zero in the others.
+        """
+        if self._liveflow_v1:
+            for family, value in seconds.items():
+                if value is not None and value == value:
+                    self._step_exp_cur[family] = max(float(value), 0.0)
+
+    def _series_args(self):
+        """string_args carrying the window's per-step series (see step_series.py), or nothing."""
+        if not (self._liveflow_v1 and self._window_step_walls):
+            return {}
+        n = len(self._window_step_walls)
+        series = {"wall": list(self._window_step_walls)}
+        for family, values in self._window_step_exp.items():
+            if len(values) == n:
+                series[family] = list(values)
+        text = step_series.encode(self._completed_steps - n + 1, series)
+        return {"step_series": _STR_TAG(text)} if text else {}
 
     def set_total_steps(self, total_steps: int) -> None:
         """Exact configured step limit, including a partial final epoch."""
@@ -272,6 +365,7 @@ class Window:
 
         self._physical_window = dict(self._physical_current)
         self._window_step_walls = []
+        self._window_step_exp = {}
         # This is a boundary — emit window.start
         self._window_index += 1
         self._active = True
@@ -310,6 +404,12 @@ class Window:
             _wall = time.perf_counter() - self._step_started
             if self._active:
                 self._window_step_walls.append(_wall)
+                n_steps = len(self._window_step_walls)
+                for family in set(self._window_step_exp) | set(self._step_exp_cur):
+                    col = self._window_step_exp.setdefault(family, [])
+                    col.extend([0.0] * (n_steps - 1 - len(col)))        # family first noted late in the window
+                    col.append(self._step_exp_cur.get(family, 0.0))
+            self._step_exp_cur = {}
             if self._apply_probe is not None and self._apply_probe["wall"] is None:
                 self._apply_probe["wall"] = _wall
             self._step_started = None
@@ -337,14 +437,15 @@ class Window:
                     **self._horizon_args(),
                     **self._tail_args(),
                 },
+                string_args=self._series_args(),
             )
             self._dft.exit_event()
         if self._liveflow_v1 and not self._sized and len(self._steady_step_times) == 20:
             seconds = self._agreed_step_time(statistics.median(self._steady_step_times))
-            self._every_n = max(20, math.ceil(30.0 / seconds))
+            self._every_n = freeze_window_steps(seconds, self._target_s)
             self._counter = 0  # change cadence only after closing a whole window
             self._sized = True
-            logger.info("window.liveflow_v1_sized", extra={"target_seconds": 30.0,
+            logger.info("window.liveflow_v1_sized", extra={"target_seconds": self._target_s,
                         "steady_step_seconds": seconds, "every_n": self._every_n})
         return True
 
@@ -401,6 +502,7 @@ class Window:
                         **self._horizon_args(),
                         **self._tail_args(),
                     },
+                    string_args=self._series_args(),
                 )
                 self._dft.exit_event()
             emitted = True

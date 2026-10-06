@@ -1,0 +1,313 @@
+"""Per-step verification state and decisions for CoordinateBanditPlanner (LIVEFLOW_VERIFY=per_step).
+
+A mixin: it owns the per-step timeline decoded from the window records, the node telemetry deltas,
+the side-cost ledger and the refuted-move memory, and answers four questions for the planner:
+
+  * `_sv_enabled()`                 is the per-step path selected and is there data for it
+  * `_sv_predicted_exposure()`      the measured bound a move of this knob can recover (per step)
+  * `_sv_required_steps()`          steps a verdict on that effect needs (power rule, block-adjusted)
+  * `_sv_verdict()`                 confirm / revert / collect for an applied move (step_verify.py)
+  * `_sv_gate()`                    side-effect pricing of the next move of a knob
+
+Nothing here changes the window-mean path: with LIVEFLOW_VERIFY=window_mean the planner never calls it.
+"""
+import math
+import os
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import structlog
+
+from .. import step_series
+from . import step_verify as sv
+
+logger = structlog.get_logger()
+
+# The first steps of a run are cold (first-collective, kernel compile, page cache).  Window.stop sizes
+# the cadence from steps 6..25 for the same reason; the verification excludes steps <= WARMUP_STEPS
+# from every segment for the same reason.
+WARMUP_STEPS = 5
+_TIMELINE_WINDOWS = 256
+_MODES = ("per_step", "window_mean")
+
+
+def verify_mode() -> str:
+    mode = os.environ.get("LIVEFLOW_VERIFY", "per_step").strip().lower()
+    if mode not in _MODES:
+        logger.warning("optimizer.verify.bad_mode", value=mode, using="per_step")
+        return "per_step"
+    return mode
+
+
+class StepVerifyMixin:
+    def _sv_init(self):
+        self._verify = verify_mode()
+        self._tl: List[step_series.StepSeries] = []
+        self._tele: Dict[int, dict] = {}          # window -> {reclaim, anon_kb, avail_kb}
+        self._tele_prev: Optional[dict] = None
+        self._side: Dict[str, sv.SideCost] = {}   # per knob, latest measured side cost
+        self._side_watch: Dict[str, dict] = {}    # per knob, the applied move whose side effects are measured
+        self._refuted: Dict[tuple, dict] = {}     # (short, from, to, other knobs) -> pre-move exposure interval
+        self._tried: Dict[tuple, str] = {}        # (short, from, to, other knobs) -> 'better' | 'worse' (measured)
+        self._sv_last: Dict[str, dict] = {}       # per knob, the latest verdict record (for logs/tests)
+        self._sv_absent_logged = False
+
+    # ------------------------------------------------------------------ ingestion
+    def _sv_ingest(self, window: int, m: dict) -> None:
+        """Decode this window's per-step series and node telemetry (before any early return)."""
+        if self._verify != "per_step":
+            return
+        ss = step_series.decode(m.get("step_series"))
+        if ss is not None:
+            if not self._tl or ss.first > self._tl[-1].last:
+                ss.window = window
+                self._tl.append(ss)
+                if len(self._tl) > _TIMELINE_WINDOWS:
+                    del self._tl[: len(self._tl) - _TIMELINE_WINDOWS]
+        elif not self._sv_absent_logged and m.get("liveflow_v1_attribution") == 1.0:
+            self._sv_absent_logged = True
+            logger.info("optimizer.verify.step_series_absent", window=window,
+                        note="the window record carries no per-step series; window-mean verification is used")
+        # Cumulative node counters (vmstat) -> per-window deltas; anonymous memory is a level.
+        cur = {k: m.get(k) for k in ("vm_allocstall", "vm_pgscan_direct", "vm_compact_stall")}
+        tele = {"anon_kb": m.get("mem_anon_kb"), "avail_kb": m.get("mem_avail_kb"), "reclaim": None}
+        if all(v is not None for v in cur.values()):
+            if self._tele_prev is not None:
+                tele["reclaim"] = sum(max(float(cur[k]) - float(self._tele_prev[k]), 0.0) for k in cur)
+            self._tele_prev = {k: float(v) for k, v in cur.items()}
+        self._tele[window] = tele
+        if len(self._tele) > _TIMELINE_WINDOWS:
+            for old in sorted(self._tele)[: len(self._tele) - _TIMELINE_WINDOWS]:
+                del self._tele[old]
+
+    def _sv_enabled(self) -> bool:
+        return self._verify == "per_step" and bool(self._tl)
+
+    # ------------------------------------------------------------------ segments
+    def _sv_key(self, short: str, ss: Optional[step_series.StepSeries] = None) -> Optional[str]:
+        """The series that carries the targeted family's per-step exposure."""
+        dom = self._domain.get(short)
+        have = (ss or self._tl[-1]).series if (ss is not None or self._tl) else {}
+        if dom == "input":
+            return "job_input" if "job_input" in have else ("storage" if "storage" in have else None)
+        return dom if dom in have else None
+
+    def _sv_segment(self, key: str, lo_excl: float, hi_incl: float):
+        """(values, weights) of `key` over steps in (lo_excl, hi_incl], warm-up excluded."""
+        xs, ws = [], []
+        lo = max(lo_excl, WARMUP_STEPS)
+        for ss in self._tl:
+            if key not in ss.series or ss.last <= lo or ss.first > hi_incl:
+                continue
+            starts = ss.bin_starts()
+            keep = (starts > lo) & (starts <= hi_incl)
+            if keep.any():
+                xs.append(ss.series[key][keep])
+                ws.append(ss.weights[keep])
+        if not xs:
+            return np.array([]), np.array([])
+        return np.concatenate(xs), np.concatenate(ws)
+
+    def _sv_boundaries(self) -> List[int]:
+        changes = self._physical_changes if self._physical_latest_cfg is not None else []
+        return sorted({int(c[2]) for c in changes if c[2] is not None})
+
+    def _sv_current_segment_start(self) -> int:
+        b = self._sv_boundaries()
+        return b[-1] if b else 0
+
+    # ------------------------------------------------------------------ admission
+    def _sv_predicted_exposure(self, short: str) -> Optional[Tuple[float, str]]:
+        """Lower bound of the targeted family's mean per-step exposure over the CURRENT configuration."""
+        if not self._sv_enabled():
+            return None
+        key = self._sv_key(short)
+        if key is None:
+            return None
+        x, w = self._sv_segment(key, self._sv_current_segment_start(), float("inf"))
+        if len(x) < 2:
+            return None
+        lb = sv.mean_lower_bound(x, w)
+        if lb is None or lb <= 0.0:
+            return 0.0, "no_exposed_time"
+        return lb, "step_exposure:%s" % key
+
+    def _sv_required_steps(self, short: str, delta: float, remaining: Optional[float]) -> Optional[Tuple[int, dict]]:
+        """Steps a verdict on an effect of `delta` s/step needs, and whether the horizon holds them.
+
+        Power rule (alpha, power as everywhere in this planner): the blocks needed to resolve `delta`
+        against the per-step spread of the step time, times the block length that spread is measured
+        with (the same rule the bootstrap uses).  Only the AFTER segment is still to be collected.
+        """
+        if not self._sv_enabled() or delta is None or delta <= 0.0:
+            return None
+        x, w = self._sv_segment("wall", self._sv_current_segment_start(), float("inf"))
+        if len(x) < 2:
+            return None
+        L, sigma = sv.effective_blocks(x)
+        z = self._z(1.0 - self._alpha / 2.0) + self._z(self._power)
+        blocks = int(math.ceil((z * sigma / float(delta)) ** 2)) if sigma > 0 else 1
+        need = max(blocks * L, self._min_samples, 2 * L)
+        why = {"n_required_steps": need, "L": L, "sigma_step": round(sigma, 6), "blocks": blocks,
+               "horizon_unit": "steps", "alpha": self._alpha, "power": self._power}
+        if remaining is not None and remaining > 0 and need > remaining:
+            why.update(reachable=False, horizon=int(remaining), reason="exceeds_horizon")
+        else:
+            why.update(reachable=True, reason="derived")
+        return need, why
+
+    # ------------------------------------------------------------------ verification
+    def _sv_verdict(self, short: str, old_value, cur, change_step: int, window: int) -> Optional[str]:
+        """'confirm' | 'revert' | 'collect' for an applied move, or None when per-step data cannot judge it."""
+        if not self._sv_enabled():
+            return None
+        key = self._sv_key(short)
+        if key is None:
+            return None
+        bounds = self._sv_boundaries()
+        prev = max([b for b in bounds if b < change_step], default=0)
+        nxt = min([b for b in bounds if b > change_step], default=float("inf"))
+        wall_pre, w_pre = self._sv_segment("wall", prev, change_step)
+        wall_post, w_post = self._sv_segment("wall", change_step, nxt)
+        if len(wall_pre) < 1 or len(wall_post) < 1:
+            return None
+        exp_pre, wx_pre = self._sv_segment(key, prev, change_step)
+        exp_post, wx_post = self._sv_segment(key, change_step, nxt)
+        wall_ci = sv.diff_ci(wall_pre, wall_post, w_pre, w_post)
+        exp_ci = sv.diff_ci(exp_pre, exp_post, wx_pre, wx_post) if len(exp_pre) and len(exp_post) else None
+        verdict = sv.verdict(wall_ci, self._min_samples)
+        rec = {"window": window, "knob": short, "from": old_value, "to": cur, "applied_step": change_step,
+               "pre_steps": [prev + 1, change_step], "post_until": None if nxt == float("inf") else nxt,
+               "target_series": key, "step_ci": wall_ci, "exposure_ci": exp_ci, "verdict": verdict,
+               "n_post": int(w_post.sum()), "n_pre": int(w_pre.sum())}
+        self._sv_last[short] = rec
+        logger.info("optimizer.cbandit.step_verify", **{k: (_clean(v)) for k, v in rec.items()})
+        if verdict in ("confirm", "revert"):
+            others = self._sv_others(short)
+            better = verdict == "confirm"
+            self._tried[(short, old_value, cur, others)] = "better" if better else "worse"
+            self._tried[(short, cur, old_value, others)] = "worse" if better else "better"
+        if verdict == "revert" and exp_pre.size:
+            lb = sv.mean_lower_bound(exp_pre, wx_pre)
+            hi = float(np.quantile(sv.mbb_means(exp_pre, wx_pre, sv.block_length(exp_pre)[0],
+                                                np.random.default_rng(sv.SEED)), 0.975))
+            self._refuted[(short, old_value, cur, self._sv_others(short))] = {"lo": lb, "hi": hi, "window": window}
+        return verdict
+
+    def _sv_escalation_state(self, short: str, current, alts: list) -> Optional[Tuple[bool, str]]:
+        """May a costlier actuator pass this coordinate? Decided on MEASURED verdicts of this configuration.
+
+        A neighbouring value counts as tried only when a verified move to it (or from it) was measured with
+        every other knob as it is now; arm samples pooled across other knobs' values do not count. Untried
+        neighbour -> stay on this coordinate; measured better -> it should move there; every neighbour
+        measured worse -> exhausted.
+        """
+        if not self._sv_enabled():
+            return None
+        others = self._sv_others(short)
+        if short not in self._relocating:
+            alts = [lv for lv in alts if _f(lv) > _f(current)]          # only raises are explored (see _pick)
+        for lv in alts:
+            st = self._tried.get((short, current, lv, others))
+            if st is None:
+                return False, "untried_neighbour:%s" % lv
+            if st == "better":
+                return False, "helpful_neighbour:%s" % lv
+        return True, "neighbourhood_exhausted_no_help"
+
+    def _sv_others(self, short: str) -> tuple:
+        """The rest of the configuration: a refutation holds only while the other knobs are as they were."""
+        cfg = self._physical_latest_cfg or self._short_cfg()
+        return tuple(sorted((k, v) for k, v in cfg.items() if k != short))
+
+    def _sv_refuted(self, short: str, cur, to, exposure_lb: Optional[float]) -> Optional[str]:
+        """Veto text while the targeted exposure has not risen above what it was when this move failed."""
+        key = (short, cur, to, self._sv_others(short))
+        rec = self._refuted.get(key)
+        if rec is None or exposure_lb is None:
+            return None
+        if exposure_lb > rec["hi"]:
+            self._refuted.pop(key, None)                  # the family is now measurably more exposed
+            return None
+        return "refuted:measured_not_better_at_exposure<=%.4f" % rec["hi"]
+
+    # ------------------------------------------------------------------ side effects
+    def _sv_sync_watches(self) -> None:
+        """Watch the side effects of the most recent applied change of every knob."""
+        if self._verify != "per_step" or self._physical_latest_cfg is None:
+            return
+        for short, new, step in self._physical_changes:
+            if step is None:
+                continue
+            meta = self._side_watch.get(short)
+            if meta is not None and meta["step"] >= int(step):
+                continue
+            old = self._physical_change_old.get((short, step))
+            unit = abs(_f(new) - _f(old)) if old is not None else 0.0
+            if unit <= 0.0:
+                continue
+            cost_us = self._cost_by_step.get(step)
+            self._side_watch[short] = {"step": int(step), "unit": unit,
+                                       "apply_s": (cost_us / 1e6) if cost_us is not None else 0.0}
+
+    def _sv_update_side_effects(self) -> None:
+        """Refresh each watched move's measured side cost from its post-apply steps and windows."""
+        if not self._sv_enabled():
+            return
+        bounds = self._sv_boundaries()
+        for short, meta in list(self._side_watch.items()):
+            step = meta["step"]
+            nxt = min([b for b in bounds if b > step], default=float("inf"))
+            wall_pre, _ = self._sv_segment("wall", max([b for b in bounds if b < step], default=0), step)
+            wall_post, w_post = self._sv_segment("wall", step, nxt)
+            if len(wall_pre) < 1 or len(wall_post) < 2:
+                continue
+            L = sv.block_length(wall_post)[0]
+            wins = []
+            rss0 = None
+            for ss in self._tl:
+                t = self._tele.get(ss.window)
+                if t is None:
+                    continue
+                if ss.first > step and ss.first <= nxt:
+                    wins.append({"n": ss.n, "mean_wall": float(np.average(ss.series["wall"], weights=ss.weights)),
+                                 "reclaim": t.get("reclaim"), "anon_kb": t.get("anon_kb")})
+                elif ss.last <= step and t.get("anon_kb") is not None:
+                    rss0 = t["anon_kb"]                    # the last window entirely before the apply
+                elif ss.first <= step < ss.last and rss0 is None and t.get("anon_kb") is not None:
+                    rss0 = t["anon_kb"]
+            cost = sv.measure_side_cost(wall_pre, wall_post, w_post, L, meta["apply_s"], meta["unit"], wins, rss0)
+            if cost is not None:
+                self._side[short] = cost
+                logger.info("optimizer.cbandit.side_cost", knob=short, applied_step=step, **cost.as_dict())
+
+    def _sv_gate(self, short: str, cur, value, delta, remaining, apply_s: Optional[float]) -> Optional[str]:
+        """Side-effect pricing of the next move of `short` (see step_verify.price_next_move)."""
+        if self._verify != "per_step" or short not in self._side:
+            return None
+        avail = None
+        for w in sorted(self._tele, reverse=True):
+            if self._tele[w].get("avail_kb") is not None:
+                avail = float(self._tele[w]["avail_kb"])
+                break
+        unit = abs(_f(value) - _f(cur))
+        return sv.price_next_move(self._side[short], unit, delta, remaining, apply_s or 0.0, avail)
+
+
+def _f(v) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _clean(v):
+    if isinstance(v, dict):
+        return {k: _clean(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_clean(x) for x in v]
+    if isinstance(v, (np.floating, np.integer)):
+        return v.item()
+    if isinstance(v, float):
+        return round(v, 6)
+    return v

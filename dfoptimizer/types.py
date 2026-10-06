@@ -256,7 +256,7 @@ class DiagnosisFindingMsg:
     window_index: int = 0
     publish_mode: str = "control"
     suppresses_tags: List[str] = dc.field(default_factory=list)
-    key_metrics: Dict[str, float] = dc.field(default_factory=dict)
+    key_metrics: Dict[str, Any] = dc.field(default_factory=dict)  # floats, plus the string step_series
 
 
 @dc.dataclass

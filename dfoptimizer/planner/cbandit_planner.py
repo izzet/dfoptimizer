@@ -70,10 +70,11 @@ import structlog
 from ..types import ActionPlan, DiagnosisFindingMsg, KnobDef
 from .clbo import accept_decision
 from .clbo_planner import _domain_of, _levels_for, domains_from_metrics
+from .step_planner import StepVerifyMixin
 
 logger = structlog.get_logger()
 
-class CoordinateBanditPlanner:
+class CoordinateBanditPlanner(StepVerifyMixin):
     """Drop-in alternative to Planner / CLBOPlanner for DFOPTIMIZER_ALGO=cbandit."""
 
     def __init__(self):
@@ -409,6 +410,9 @@ class CoordinateBanditPlanner:
         # the SAME value is the repeat that cost five copies a node (4s.32); a plan for a different
         # value is a real decision and is not suppressed.
         self._reloc_published: Dict[str, object] = {}
+        # PER-STEP VERIFICATION (LIVEFLOW_VERIFY=per_step, default; window_mean = the window-mean rule
+        # the v1 campaigns ran). State and decisions live in step_planner.StepVerifyMixin.
+        self._sv_init()
 
     # --- Planner-compatible registration (identical contract to Planner/CLBOPlanner) ---
     def register_knobs(self, knob_defs, current_values=None):
@@ -760,6 +764,11 @@ class CoordinateBanditPlanner:
                         if _was is not None:
                             self._refine[short] = cfg[short] < _was
                         self._physical_change_old[(short, step)] = _was
+                        if self._verify == "per_step":
+                            # Per-step verdicts, not pooled arms, are the evidence about an interacting
+                            # configuration: every other knob's arm samples (keyed by that knob's value alone)
+                            # now mix configurations that no longer run (halo M: read and decode threads interact).
+                            self._reset_other_arms(short, window)
                     self.current_values[kid] = cfg[short]
                 self._physical_latest_cfg = dict(cfg)
             # Every node learns what the apply measurably cost from the shared applied-vector
@@ -788,6 +797,10 @@ class CoordinateBanditPlanner:
 
     def _finalize_window(self, window: int) -> Optional[dict]:
         m = self._win_metrics
+        # The per-step series and node telemetry are evidence about the steps themselves, whether or
+        # not this window can be credited to a configuration (an apply window is not, but its steps
+        # after the apply boundary are post-apply steps).
+        self._sv_ingest(window, m)
         if m.get("liveflow_v1_attribution") == 1.0:
             if m.get("planner_history_ready") != 1 or m.get("lf_v1_per_step") != 1:
                 logger.info("optimizer.liveflow_v1.unready_history", window=window)
@@ -1193,6 +1206,24 @@ class CoordinateBanditPlanner:
             if cur == old_value:
                 self._move_from.pop(short, None)
                 continue
+            if self._verify == "per_step" and self._rate_mode and short not in self._relocating:
+                _chg = [c for c in (self._physical_changes if self._physical_latest_cfg is not None
+                                    else []) if c[0] == short]
+                if _chg:
+                    _sv = self._sv_verdict(short, old_value, cur, int(_chg[-1][2]), window)
+                    if _sv == "confirm":
+                        _rec = self._sv_last.get(short, {})
+                        logger.info("optimizer.cbandit.move_confirmed", window=window, knob=short, value=cur,
+                                    verdict="confirmed_per_step", metric="step_time_interval",
+                                    step_ci=_rec.get("step_ci"), exposure_ci=_rec.get("exposure_ci"),
+                                    delta=_rounded(delta),
+                                    reason="the 95% block-bootstrap interval of the step-time change excludes zero (faster)")
+                        self._move_from.pop(short, None)
+                        continue
+                    if _sv == "revert":
+                        return short, old_value
+                    if _sv == "collect":
+                        continue
             cand = list(self._samples.get((short, cur), ()))
             cand_tail = list(self._tail_samples.get((short, cur), ()))
             if self._rate_mode and short not in self._relocating:
@@ -1537,6 +1568,14 @@ class CoordinateBanditPlanner:
         own = self._domain.get(short)
         if not own:
             return None, "no_domain"
+        if self._rate_mode and self._verify == "per_step":
+            # The measured bound a move of this knob can recover, from the per-step series of the
+            # family it targets over the current configuration: the lower end of the 95% block-bootstrap
+            # interval of the mean exposure. It needs steps, not min_samples windows.
+            got = self._sv_predicted_exposure(short)
+            if got is not None:
+                ex, src = got
+                return (ex, "domain_exposed:%s" % src) if ex > 0.0 else (None, "no_exposed_time")
         if self._rate_mode and self._epoch_windows < self._min_samples:
             return None, "insufficient_samples:%d<%d" % (self._epoch_windows, self._min_samples)
         ex = self._epoch_domain_exposed(own)
@@ -1637,6 +1676,17 @@ class CoordinateBanditPlanner:
         which is the whole point: `neighbourhood_exhausted_no_help` may not be declared from a
         sample that could not have contained the cost (4s.17).
         """
+        if self._rate_mode and self._verify == "per_step" and short is not None and delta:
+            got = self._sv_required_steps(short, float(delta), remaining)
+            if got is not None:
+                need_steps, swhy = got
+                K = max(int(self._control_steps), 1)
+                dwell = max(1, int(math.ceil(need_steps / K)))
+                swhy.update(floor=self._min_samples, effect_floor=self._effect_floor, sigma_from="step_series",
+                            n_required_steps=need_steps, dwell_steps=need_steps, dwell_windows=dwell)
+                if not swhy.get("reachable", True):
+                    return int(remaining // K), swhy
+                return dwell, swhy
         st = sigma_override
         src = "recent_run"
         if st is None:
@@ -1897,6 +1947,10 @@ class CoordinateBanditPlanner:
         horizon is not payable. COST_W=0 removes the cost and payback terms for the ablation.
         """
         cands = self._neighbourhood(short, current)
+        if self._verify == "per_step" and self._rate_mode and short not in self._relocating:
+            # A move targets one family's exposure and relieves it by RAISING the resource; lowering is
+            # reached only by a verdict (revert) or the measured-capacity path, never by exploration.
+            cands = [lv for lv in cands if lv == current or _num(lv) > _num(current)]
         self._last_pick_note = None
         if self._strict_explore and short in self._shipped and short not in self._relocating:
             # A2(2): never explore below the shipped value (over-provisioned capacity decreases are
@@ -2243,6 +2297,10 @@ class CoordinateBanditPlanner:
                 pass
         if not alts:
             return True, "neighbourhood_exhausted"
+        if self._rate_mode and self._verify == "per_step":
+            got = self._sv_escalation_state(short, current, alts)
+            if got is not None:
+                return got
         # THE SAMPLE MUST BE ABLE TO CONTAIN THE COST, not merely reach min_samples.
         #
         # 4s.17: `read_threads=1` was confirmed 936 times with `neighbourhood_exhausted_no_help` on
@@ -2403,6 +2461,8 @@ class CoordinateBanditPlanner:
             self._record(obs["cfg"], obs["wall"], window=completed, tail=obs.get("tail"))
 
             # Verification runs even when this window has no actionable exposure.
+            self._sv_sync_watches()
+            self._sv_update_side_effects()
             revert = self._unconfirmed_move(completed, obs.get("remaining"))
             if revert is not None:
                 rshort, rback = revert
@@ -2854,6 +2914,15 @@ class CoordinateBanditPlanner:
                         if cand_choice != cand_cur:
                             _veto = self._apply_cost_veto(cand_short, cand_cur, cand_choice,
                                                           delta, rem_w, completed)
+                            if _veto is None and self._verify == "per_step" and self._rate_mode:
+                                _veto = (self._sv_refuted(cand_short, cand_cur, cand_choice, delta)
+                                         or self._sv_gate(cand_short, cand_cur, cand_choice, delta, rem_w,
+                                                          self._measured_apply_cost(cand_short, cand_cur,
+                                                                                    cand_choice)))
+                                if _veto is not None:
+                                    logger.info("optimizer.cbandit.side_effect_veto", window=completed,
+                                                knob=cand_short, current=cand_cur, to=cand_choice,
+                                                reason=_veto)
                             if _veto is not None:
                                 cand_choice, self._last_pick_note = cand_cur, _veto
                         if cand_choice == cand_cur:
