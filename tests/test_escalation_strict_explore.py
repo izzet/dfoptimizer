@@ -7,16 +7,17 @@ import sys
 from collections import deque
 from pathlib import Path
 
-os.environ.update(LIVEFLOW_WORKLOAD="dlio-tf", LIVEFLOW_PRESET="liveflow-v1", DFOPTIMIZER_ALGO="cbandit",
-                  DFOPTIMIZER_CBANDIT_STRICT_EXPLORE="1")
+os.environ.setdefault("LIVEFLOW_WORKLOAD", "dlio-tf")
+os.environ.setdefault("LIVEFLOW_PRESET", "liveflow-v1")
+os.environ.setdefault("DFOPTIMIZER_ALGO", "cbandit")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from dfoptimizer.planner.cbandit_planner import CoordinateBanditPlanner  # noqa: E402
 from dfoptimizer.runtime.knob import knob, knob_def_from_dict  # noqa: E402
 
 
-def _planner(strict):
-    os.environ["DFOPTIMIZER_CBANDIT_STRICT_EXPLORE"] = "1" if strict else "0"
+def _planner(strict, monkeypatch):
+    monkeypatch.setenv("DFOPTIMIZER_CBANDIT_STRICT_EXPLORE", "1" if strict else "0")
     pl = CoordinateBanditPlanner()
     resp = lambda tag: {tag: {"direction": "increase", "step_mode": "add", "step": 2, "min_persistence": 1,
                               "cooldown_windows": 1, "apply_when": "window_boundary"}}
@@ -33,23 +34,23 @@ def _sample(pl, level, walls):
     pl._samples[("prefetch_size", level)] = deque(walls, maxlen=64)
 
 
-def test_below_shipped_neighbour_does_not_block_escalation():
-    pl = _planner(strict=True)
+def test_below_shipped_neighbour_does_not_block_escalation(monkeypatch):
+    pl = _planner(strict=True, monkeypatch=monkeypatch)
     _sample(pl, 2, [0.0100, 0.0101, 0.0099, 0.0100])      # incumbent
     _sample(pl, 4, [0.0101, 0.0102, 0.0100, 0.0101])      # tried, not better (reverted)
     may, why = pl._escalation_state("prefetch_size", 2)
     assert may is True and why == "neighbourhood_exhausted_no_help", (may, why)
 
 
-def test_an_untried_higher_neighbour_still_holds_escalation_back():
-    pl = _planner(strict=True)
+def test_an_untried_higher_neighbour_still_holds_escalation_back(monkeypatch):
+    pl = _planner(strict=True, monkeypatch=monkeypatch)
     _sample(pl, 2, [0.0100, 0.0101, 0.0099, 0.0100])
     may, why = pl._escalation_state("prefetch_size", 2)
     assert may is False and why.startswith("untried_neighbour:4"), (may, why)
 
 
-def test_without_strict_explore_the_lower_neighbour_is_still_required():
-    pl = _planner(strict=False)
+def test_without_strict_explore_the_lower_neighbour_is_still_required(monkeypatch):
+    pl = _planner(strict=False, monkeypatch=monkeypatch)
     _sample(pl, 2, [0.0100, 0.0101, 0.0099, 0.0100])
     _sample(pl, 4, [0.0101, 0.0102, 0.0100, 0.0101])
     may, why = pl._escalation_state("prefetch_size", 2)
