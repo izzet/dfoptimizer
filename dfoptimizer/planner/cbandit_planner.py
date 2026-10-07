@@ -1967,9 +1967,9 @@ class CoordinateBanditPlanner(StepVerifyMixin):
                 out.append(max(half, key=_num))
             up = self._next_up(short, levels[i])
             ll = self._ll_level(short, current)
-            if ll is not None and (up is None or ll > _num(up)):
+            if ll is not None:
                 self._add_level(short, ll)       # the model's level joins the grid so the candidate list stays on it
-                up = ll
+                up = ll                          # and replaces the geometric raise: above it or between current and it
             if up is not None:
                 out.append(up)
             return out

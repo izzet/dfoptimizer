@@ -206,3 +206,16 @@ def test_after_a_revert_the_model_level_is_not_proposed_again_from_the_restored_
     assert p._ll_level("decode_threads", 1) == 4
     p._refine["decode_threads"] = True                      # set by the planner when it observes a decrease
     assert p._ll_level("decode_threads", 1) is None
+
+
+def test_a_model_level_between_the_current_value_and_the_next_geometric_step_is_proposed_as_it_is(monkeypatch):
+    p = _planner(monkeypatch, "littles_law")
+    # decode already 2: wall 0.10, wait 0.05 -> T_free 0.05; service 0.14 -> ceil(2.8) = 3 (geometric would be 4)
+    cfg = {"read_threads": 1, "decode_threads": 2}
+    first, plans = 6, []
+    for w in range(1, 8):
+        plans = p.process_finding(_finding(w, cfg, first, svc_dec=0.14))
+        first += STEPS_PER_WINDOW
+        if plans:
+            break
+    assert [(x.knob_id, x.new_value) for x in plans] == [("halo3d.decode_threads", 3)]
