@@ -70,6 +70,7 @@ import structlog
 from ..types import ActionPlan, DiagnosisFindingMsg, KnobDef
 from .clbo import accept_decision
 from .clbo_planner import _domain_of, _levels_for, domains_from_metrics
+from . import sizing
 from .step_planner import StepVerifyMixin
 
 logger = structlog.get_logger()
@@ -413,6 +414,12 @@ class CoordinateBanditPlanner(StepVerifyMixin):
         # PER-STEP VERIFICATION (LIVEFLOW_VERIFY=per_step, default; window_mean = the window-mean rule
         # the v1 campaigns ran). State and decisions live in step_planner.StepVerifyMixin.
         self._sv_init()
+        # LIVEFLOW_SIZING=littles_law|geometric (default littles_law): see planner/sizing.py.  `_ll` is the CURRENT window's
+        # Little's-law result per sizable knob; `_ll_partners[lead]` the other knobs moved in the same plan as an LL-sized lead
+        # (restored together if the lead is reverted).
+        self._sizing = sizing.sizing_mode()
+        self._ll: Dict[str, dict] = {}
+        self._ll_partners: Dict[str, Tuple[int, Dict[str, object]]] = {}
 
     # --- Planner-compatible registration (identical contract to Planner/CLBOPlanner) ---
     def register_knobs(self, knob_defs, current_values=None):
@@ -862,6 +869,7 @@ class CoordinateBanditPlanner(StepVerifyMixin):
         # the argmax, there is nothing to move and the planner declines. That is a comparison, not
         # a threshold -- no constant says how much unexplained time is "too much".
         unattributed = max(float(wall) - sum(domains.values()), 0.0)
+        self._sizing_update(m, float(wall), domains, window)
         skew = self._skew_from_metrics(m, wall) if self._skew_link and not self._rate_mode else None
         if skew is not None:
             domains, unattributed = skew["domains"], skew["unattributed"]
@@ -1191,6 +1199,8 @@ class CoordinateBanditPlanner(StepVerifyMixin):
         moved value has `n_required(delta)` observations, and only when `accept_decision` refuses.
         Returns None otherwise, which is the common case.
         """
+        for _lead in [k for k in self._ll_partners if k not in self._move_from]:
+            self._ll_partners.pop(_lead, None)       # the lead's move was confirmed or superseded: nothing left to revert together
         for short, entry in list(self._move_from.items()):
             old_value, delta, _w = entry[0], entry[1], entry[2]
             base_mean = entry[3] if len(entry) > 3 else None
@@ -1876,6 +1886,69 @@ class CoordinateBanditPlanner(StepVerifyMixin):
         bytes_per_node = per_window * float(wpe)
         return bytes_per_node / self._stage_rate_gbs
 
+    # ------------------------------------------------------------------ Little's-law sizing
+    def _sizing_update(self, m: dict, wall: float, domains: dict, window: int) -> None:
+        """This window's Little's-law level of every sizable parallelism knob (planner/sizing.py)."""
+        self._ll = {}
+        if self._sizing != "littles_law" or not self._rate_mode:
+            return
+        knobs = {}
+        for kid, short in self._short.items():
+            kd = self.knobs[kid]
+            cur = self._short_cfg().get(short)
+            if short in sizing.STAGES_OF_KNOB and kd.type is int and kd.range and cur is not None:
+                knobs[short] = (cur, kd.range[0], kd.range[1])
+        if not knobs:
+            return
+        self._ll = sizing.size_knobs(m, wall, domains, knobs)
+        if self._ll:
+            logger.info("optimizer.cbandit.sizing", window=window, knobs=self._ll,
+                        exposed_wait_s={d: round(float(domains.get(d, 0.0) or 0.0), 6)
+                                        for d in ("input", "decode", "delivery") if d in domains})
+
+    def _ll_level(self, short: str, current) -> Optional[int]:
+        """The Little's-law level of `short` when it lies above the current value, else None (geometric/refinement applies)."""
+        if self._sizing != "littles_law" or not self._rate_mode:
+            return None
+        e = self._ll.get(short)
+        if not e or self._refine.get(short):         # after a revert: refinement, not another model jump
+            return None
+        t = e["target"]
+        return int(t) if t > _num(current) else None
+
+    def _add_level(self, short: str, value) -> None:
+        levels = self._levels.get(short)
+        if levels is not None and value not in levels:
+            self._levels[short] = sorted(set(levels) | {value}, key=_num)
+
+    def _ll_underprovisioned(self, short: str) -> bool:
+        cur = self._short_cfg().get(short)
+        return cur is not None and self._ll_level(short, cur) is not None
+
+    def _ll_partner_moves(self, lead: str, lead_to, cfg_now: dict, doms: dict) -> Dict[str, int]:
+        """Other under-provisioned stages of the input side, sized in the SAME plan as an LL-sized lead (one apply, one verification).
+
+        A partner joins only when the model sizes it above its current value, its own stage's exposed wait is positive in this
+        window, and its raise to that level has not been refuted at the exposure it has now.
+        """
+        out: Dict[str, int] = {}
+        for short in self._short.values():
+            if short == lead or short not in sizing.STAGES_OF_KNOB or self._domain.get(short) not in ("input", "decode", "delivery"):
+                continue
+            cur = cfg_now.get(short)
+            lv = self._ll_level(short, cur) if cur is not None else None
+            if lv is None:
+                continue
+            stage = sizing.STAGES_OF_KNOB[short][0]
+            if not float(doms.get(sizing.STAGE_DOMAIN[stage], 0.0) or 0.0) > 0.0:
+                continue
+            if self._sv_active():
+                exp = self._sv_predicted_exposure(short)
+                if self._sv_refuted(short, cur, lv, exp[0] if exp else None) is not None:
+                    continue
+            out[short] = lv
+        return out
+
     def _neighbourhood(self, short: str, current) -> List:
         """{stay, one level down, one level up} -- a coordinate step, not a global jump."""
         levels = self._levels.get(short) or [current]
@@ -1893,6 +1966,10 @@ class CoordinateBanditPlanner(StepVerifyMixin):
             if half:
                 out.append(max(half, key=_num))
             up = self._next_up(short, levels[i])
+            ll = self._ll_level(short, current)
+            if ll is not None and (up is None or ll > _num(up)):
+                self._add_level(short, ll)       # the model's level joins the grid so the candidate list stays on it
+                up = ll
             if up is not None:
                 out.append(up)
             return out
@@ -2274,7 +2351,8 @@ class CoordinateBanditPlanner(StepVerifyMixin):
             return self._cost_w * min((self._move_cost(short, lv) for lv in alts),
                                       default=0.0)
 
-        return sorted(live, key=lambda s: (price(s), owned.index(s)))
+        # Little's law: a stage the model sizes above its current value is asked before one it finds adequately provisioned.
+        return sorted(live, key=lambda s: (0 if self._ll_underprovisioned(s) else 1, price(s), owned.index(s)))
 
     def _escalation_state(self, short: str, current) -> Tuple[bool, str]:
         """Whether a costlier actuator may pass this cheaper coordinate.
@@ -2470,12 +2548,18 @@ class CoordinateBanditPlanner(StepVerifyMixin):
                 rshort, rback = revert
                 nxt = dict(self._short_cfg())
                 nxt[rshort] = rback
+                joint = self._ll_partners.pop(rshort, None)
+                if joint is not None:            # a jointly sized plan is verified and reverted as one
+                    for pshort, pold in joint[1].items():
+                        nxt[pshort] = pold
+                        self._last_move_window[pshort] = completed
                 self._planned_cfg[w + 1] = dict(nxt)
                 self._last_move_window[rshort] = completed
                 self._move_from.pop(rshort, None)
                 logger.info("optimizer.cbandit.reverted", window=completed, knob=rshort,
                             back_to=rback,
-                            reason="not confirmed at its predicted effect")
+                            reason="not confirmed at its predicted effect",
+                            joint_with=(dict(joint[1]) if joint else None))
                 self._cur_window = w
                 self._win_metrics = {}
                 self._pending_finding = finding
@@ -3066,6 +3150,20 @@ class CoordinateBanditPlanner(StepVerifyMixin):
                                 self._move_base_tails.pop(short, None)
                     nxt = dict(cfg_now)
                     nxt[short] = choice
+                    if choice != cur:
+                        self._ll_partners.pop(short, None)
+                        if self._ll_level(short, cur) == choice:
+                            # The lead is sized by Little's law: size the other under-provisioned stages of the input side
+                            # in the same plan (one apply, one verification).
+                            partners = self._ll_partner_moves(short, choice, cfg_now, doms)
+                            for pshort, pto in partners.items():
+                                self._add_level(pshort, pto)
+                                nxt[pshort] = pto
+                                self._last_move_window[pshort] = completed
+                            if partners:
+                                self._ll_partners[short] = (completed, {p: cfg_now[p] for p in partners})
+                            logger.info("optimizer.cbandit.sizing_move", window=completed, lead=short, to=choice,
+                                        partners=partners or None, inputs={k: self._ll.get(k) for k in [short, *partners]})
                     self._planned_cfg[w + 1] = dict(nxt)
                     if choice != cur:
                         plans = self._plans_for(nxt, finding, dom)
