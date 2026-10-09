@@ -99,6 +99,7 @@ class CoordinateBanditPlanner(StepVerifyMixin):
         # joint verification (an arm keyed by one knob's value mixes every configuration that value ran in).
         self._series: Deque = deque(maxlen=4096)
         self._cur_window: int = -1
+        self._last_completed_window: int = -1
         self._win_metrics: Dict[str, float] = {}
         # A watermark is allowed to finalize only a real finding.  Retaining
         # that finding preserves the existing decision/provenance path while
@@ -2489,42 +2490,36 @@ class CoordinateBanditPlanner(StepVerifyMixin):
 
     # --- Planner-compatible decision entry ---
     def process_window_completion(self, window_index: int, *, terminal: bool = False) -> List[ActionPlan]:
-        """Finalize one pending fact window when its native successor completes.
-
-        A completion is not a finding.  Terminal completion is deliberately a
-        no-op: end-of-stream must never manufacture a last action.
-        """
-        if terminal or self._cur_window == -1 or self._pending_finding is None:
+        """Decide after all findings of this real window, never on an empty marker."""
+        if terminal or window_index <= self._last_completed_window:
             return []
-        # Completion is a watermark for the *immediate* successor, not a
-        # permission to silently bridge missing/reordered native windows.
-        # A later marker would stamp a decision with a window whose evidence
-        # belongs to an older one, so it is intentionally declined.
-        # The flat view emitted beside the pending finding has the same native
-        # window identity.  It is an ordinary same-window completion, not an
-        # ordering fault and not a decision trigger; wait for a fact-free
-        # immediate successor.  Older/duplicate markers are equally inert.
-        if window_index <= self._cur_window:
+        if self._cur_window == -1 or self._pending_finding is None:
             return []
-        if window_index != self._cur_window + 1:
+        if window_index != self._cur_window:
             logger.warning("optimizer.cbandit.window_completion.ordering_gap",
-                           pending_window=self._cur_window,
-                           completion_window=window_index)
+                           pending_window=self._cur_window, completion_window=window_index)
             return []
-        marker = _dc.replace(self._pending_finding, window_index=window_index)
-        plans = self.process_finding(marker)
-        # `process_finding` has installed the marker as a new current window.
-        # Remove it: no-fact windows never accumulate control evidence.
-        self._cur_window = -1
-        self._win_metrics = {}
-        self._pending_finding = None
-        return plans
+        finding = self._pending_finding
+        self._last_completed_window = window_index
+        try:
+            # w names the evidence that completed. Plans and planned_cfg[w+1]
+            # retain that identity; a successor finding is never manufactured.
+            return self._decide_pending_window(finding, window_index)
+        finally:
+            # Keep the last observed clock for asynchronous ACKs and registry merges.
+            self._cur_window = window_index
+            self._win_metrics = {}
+            self._pending_finding = None
 
     def process_finding(self, finding: DiagnosisFindingMsg) -> List[ActionPlan]:
         if not self.knobs:
             return []
         w = finding.window_index
-        if self._cur_window == -1:
+        if w <= self._last_completed_window:
+            return []
+        if self._pending_finding is not None and w < self._cur_window:
+            return []
+        if self._cur_window == -1 or self._pending_finding is None:
             self._cur_window = w
             self._pending_finding = finding
             self._accumulate(finding)
@@ -2534,6 +2529,18 @@ class CoordinateBanditPlanner(StepVerifyMixin):
             self._accumulate(finding)
             return []
 
+        # Compatibility fallback for streams lacking completion watermarks.
+        # The normal path completes the current window before a successor arrives.
+        completed = self._cur_window
+        plans = self._decide_pending_window(finding, w)
+        self._last_completed_window = completed
+        self._cur_window = w
+        self._win_metrics = {}
+        self._pending_finding = finding
+        self._accumulate(finding)
+        return plans
+
+    def _decide_pending_window(self, finding: DiagnosisFindingMsg, w: int) -> List[ActionPlan]:
         completed = self._cur_window
         obs = self._finalize_window(completed)
         plans: List[ActionPlan] = []
@@ -2560,19 +2567,11 @@ class CoordinateBanditPlanner(StepVerifyMixin):
                             back_to=rback,
                             reason="not confirmed at its predicted effect",
                             joint_with=(dict(joint[1]) if joint else None))
-                self._cur_window = w
-                self._win_metrics = {}
-                self._pending_finding = finding
-                self._accumulate(finding)
                 return self._plans_for(nxt, finding, self._domain[rshort])
 
             if self._win_metrics.get("observation_only") == 1.0:
                 logger.info("optimizer.cbandit.observation", window=completed,
                             reason="measured zero exposure; recorded without a new move")
-                self._cur_window = w
-                self._win_metrics = {}
-                self._pending_finding = finding
-                self._accumulate(finding)
                 return plans
 
             # 1. CROSS-LAYER DIRECTION: the dominant domain by measured time. A comparison, not a
@@ -3170,10 +3169,6 @@ class CoordinateBanditPlanner(StepVerifyMixin):
                     # choice == cur is a real decision (exploit), and it emits no plan: the
                     # application keeps running what it is running, at zero actuation cost.
 
-        self._cur_window = w
-        self._win_metrics = {}
-        self._pending_finding = finding
-        self._accumulate(finding)
         return plans
 
     @staticmethod
