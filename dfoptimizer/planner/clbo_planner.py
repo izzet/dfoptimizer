@@ -59,6 +59,13 @@ _DOMAIN_OF = {
 
 
 def _domain_of(knob_short: str) -> str:
+    # The DLIO HDF5 pool performs both reads and decompression. Its native
+    # decode exposure binds this cell; do not price it from storage alone.
+    # Scope this to the explicitly enabled reader, preserving other workloads.
+    if (knob_short == "read_threads"
+            and os.environ.get("LIVEFLOW_WORKLOAD") == "dlio-pytorch"
+            and os.environ.get("LIVEFLOW_DLIO_HDF5_DECODE", "0") == "1"):
+        return "decode"
     # `computation_threads` is the TF decode map's num_parallel_calls.  DLIO's compute domain is a
     # sleep, so it stays "compute" (actuator-less) unless the TF decode knob is explicitly
     # registered; then it is priced in the INPUT domain, because the only measurable exposure of
