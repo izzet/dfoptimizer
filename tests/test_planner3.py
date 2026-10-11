@@ -82,3 +82,54 @@ def test_window_mean_first_window_keeps_minimum(monkeypatch):
     p._epoch_windows = 1
     p._epoch_dom['decode'] = [.01]
     assert p.predicted_effect('decode_threads', 'decode')[0] is None
+
+
+def local_window(first, n, local_first=1, **extra):
+    return dict(step_series=step_series.encode(first, {'wall': [.1] * n, 'input': [.02] * n}),
+                planner_history_ready=1, epoch_nunique=1, step_nunique=n,
+                step_min=local_first, step_max=local_first+n-1, **extra)
+
+
+def test_epoch_cold_mask_is_verification_only(monkeypatch):
+    p = planner(monkeypatch)
+    p._sv_ingest(1, local_window(1001, 20))
+    # Admission/side-cost evidence retains the observed series and its weights.
+    assert p._sv_segment('wall', 1000, 1020)[1].sum() == 20
+    assert p._sv_segment('wall', 1000, 1020, steady_only=True)[1].sum() == 15
+
+
+def test_bins_overlapping_cold_steps_are_not_partially_reweighted(monkeypatch):
+    p = planner(monkeypatch)
+    p._sv_ingest(1, local_window(1001, 525))  # transport b=2: the bin for local5 also contains6
+    _, weights = p._sv_segment('input', 1000, 2000, steady_only=True)
+    assert weights.sum() == 519
+    assert len(weights) == 260 and weights[-1] == 1
+
+
+@pytest.mark.parametrize('declared', [dict(planner_history_ready=0), dict(epoch_index=0),
+                                    dict(verification_epoch_index=0)])
+def test_declared_presteady_evidence_cannot_confirm_or_trigger_futility(monkeypatch, declared):
+    p = planner(monkeypatch)
+    before = local_window(6, 200, local_first=6)
+    after = local_window(206, 200, local_first=206)
+    after.update(declared)
+    p._sv_ingest(1, before)
+    p._sv_ingest(2, after)
+    assert p._sv_verdict('decode_threads', 1, 2, 205, 2, .02) == 'collect'
+    assert p._sv_segment('wall', 205, 405)[1].sum() == 200
+
+
+@pytest.mark.parametrize('override', [dict(epoch_nunique=2), dict(step_max=21),
+                                     dict(step_nunique=19), dict(step_min=float('nan'))])
+def test_ambiguous_local_coverage_preserves_legacy_samples(monkeypatch, override):
+    p = planner(monkeypatch)
+    m = local_window(1001, 20)
+    m.update(override)
+    p._sv_ingest(1, m)
+    assert p._sv_segment('wall', 1000, 1020, steady_only=True)[1].sum() == 20
+
+
+def test_missing_epoch_coverage_keeps_legacy_global_warmup(monkeypatch):
+    p = planner(monkeypatch)
+    p._sv_ingest(1, {'step_series': step_series.encode(1, {'wall': [.1] * 20})})
+    assert p._sv_segment('wall', 0, 20, steady_only=True)[1].sum() == 15

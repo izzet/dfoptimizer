@@ -43,6 +43,7 @@ class StepVerifyMixin:
     def _sv_init(self):
         self._verify = verify_mode()
         self._tl: List[step_series.StepSeries] = []
+        self._sv_steady: Dict[int, np.ndarray] = {}  # verification-only eligibility by native window
         self._tele: Dict[int, dict] = {}          # window -> {reclaim, anon_kb, avail_kb}
         self._tele_prev: Optional[dict] = None
         self._side: Dict[str, sv.SideCost] = {}   # per knob, latest measured side cost
@@ -62,8 +63,11 @@ class StepVerifyMixin:
             if not self._tl or ss.first > self._tl[-1].last:
                 ss.window = window
                 self._tl.append(ss)
+                self._sv_steady[window] = self._sv_steady_mask(ss, m)
                 if len(self._tl) > _TIMELINE_WINDOWS:
                     del self._tl[: len(self._tl) - _TIMELINE_WINDOWS]
+                    retained = {s.window for s in self._tl}
+                    self._sv_steady = {w: mask for w, mask in self._sv_steady.items() if w in retained}
         elif not self._sv_absent_logged and m.get("liveflow_v1_attribution") == 1.0:
             self._sv_absent_logged = True
             logger.info("optimizer.verify.step_series_absent", window=window,
@@ -100,8 +104,31 @@ class StepVerifyMixin:
             return next((key for key in ("decode", "input") if key in have), None)
         return dom if dom in have else None
 
-    def _sv_segment(self, key: str, lo_excl: float, hi_incl: float):
-        """(values, weights) of `key` over steps in (lo_excl, hi_incl], warm-up excluded."""
+    @staticmethod
+    def _sv_steady_mask(ss: step_series.StepSeries, m: dict) -> np.ndarray:
+        """Exclude declared pre-steady windows and the same first-five cold steps in each epoch.
+
+        Local control-step coverage must match the wire series exactly before it can locate an
+        epoch head. Missing or ambiguous coverage keeps the legacy global warm-up rule; an epoch
+        length is never inferred. A bin containing any cold sample is excluded as a whole because
+        its mean cannot be split into observed cold and steady values.
+        """
+        keep = np.ones(len(ss.weights), dtype=bool)
+        if (m.get("planner_history_ready") == 0 or m.get("verification_epoch_index") == 0
+                or m.get("epoch_index") == 0):
+            return np.zeros(len(ss.weights), dtype=bool)
+        try:
+            first, last, count = (float(m[k]) for k in ("step_min", "step_max", "step_nunique"))
+        except (KeyError, TypeError, ValueError):
+            return keep
+        if (m.get("epoch_nunique") != 1 or not all(math.isfinite(v) for v in (first, last, count))
+                or first < 1 or first != int(first) or last != int(last)
+                or count != ss.n or last - first + 1 != ss.n):
+            return keep
+        return first + ss.bin_starts() - ss.first > WARMUP_STEPS
+
+    def _sv_segment(self, key: str, lo_excl: float, hi_incl: float, *, steady_only: bool = False):
+        """Values/weights in (lo, hi]; optionally apply verification-only cold exclusions."""
         xs, ws = [], []
         lo = max(lo_excl, WARMUP_STEPS)
         for ss in self._tl:
@@ -109,6 +136,8 @@ class StepVerifyMixin:
                 continue
             starts = ss.bin_starts()
             keep = (starts > lo) & (starts <= hi_incl)
+            if steady_only and ss.window in self._sv_steady:
+                keep &= self._sv_steady[ss.window]
             if keep.any():
                 xs.append(ss.series[key][keep])
                 ws.append(ss.weights[keep])
@@ -218,12 +247,12 @@ class StepVerifyMixin:
         bounds = self._sv_boundaries()
         prev = max([b for b in bounds if b < change_step], default=0)
         nxt = min([b for b in bounds if b > change_step], default=float("inf"))
-        wall_pre, w_pre = self._sv_segment("wall", prev, change_step)
-        wall_post, w_post = self._sv_segment("wall", change_step, nxt)
+        wall_pre, w_pre = self._sv_segment("wall", prev, change_step, steady_only=True)
+        wall_post, w_post = self._sv_segment("wall", change_step, nxt, steady_only=True)
         if len(wall_pre) < 1 or len(wall_post) < 1:
             return "collect"
-        exp_pre, wx_pre = self._sv_segment(key, prev, change_step) if key else (np.array([]), np.array([]))
-        exp_post, wx_post = self._sv_segment(key, change_step, nxt) if key else (np.array([]), np.array([]))
+        exp_pre, wx_pre = self._sv_segment(key, prev, change_step, steady_only=True) if key else (np.array([]), np.array([]))
+        exp_post, wx_post = self._sv_segment(key, change_step, nxt, steady_only=True) if key else (np.array([]), np.array([]))
         wall_ci = sv.diff_ci(wall_pre, wall_post, w_pre, w_post)
         exp_ci = sv.diff_ci(exp_pre, exp_post, wx_pre, wx_post) if len(exp_pre) and len(exp_post) else None
         verdict = sv.verdict(wall_ci, self._min_samples)
