@@ -8,10 +8,11 @@ the planner.  The planner verifies a move on them (planner/step_verify.py); noth
 Format (ASCII, one string):
 
     v1;first=<completed-step index of the first step>;n=<steps>;b=<steps per bin>;
-       wall=<csv>;storage=<csv>;decode=<csv>;delivery=<csv>;comm=<csv>;job_input=<csv>
+       wall=<csv>;input=<csv>;storage=<csv>;decode=<csv>;delivery=<csv>;comm=<csv>;job_input=<csv>
 
 Values are integers in units of 10 microseconds.  `wall` is the critical rank's step time; each other
-key is that rank's per-step exposed wait of one family (`job_input` is the job-wide per-step maximum of
+key is that rank's per-step exposed wait (`input` is combined parent fetch wait, never pure storage
+or decode; `job_input` is the job-wide per-step maximum of
 the input wait over all ranks, which every rank holds after the window's Allreduce(MAX)).  A window of
 more than MAX_BINS steps is carried as bin means of b = ceil(n / MAX_BINS) consecutive steps: the ring
 that carries window events is small, and a mean over consecutive steps loses nothing the verification
@@ -28,7 +29,7 @@ except Exception:  # pragma: no cover
 UNIT_S = 1e-5
 MAX_BINS = 512
 VERSION = "v1"
-FAMILIES = ("storage", "decode", "delivery", "comm", "job_input")
+FAMILIES = ("input", "storage", "decode", "delivery", "comm", "job_input")
 
 
 def _bin_means(values: Sequence[float], b: int):

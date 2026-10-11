@@ -1348,7 +1348,7 @@ class CoordinateBanditPlanner(StepVerifyMixin):
                     base_cfg[s2] = self._move_from[s2][0]
                 jcand = [wl for (wi, cf, wl) in self._series if wi > t_last and cf == cur_cfg]
                 jbase = [wl for (wi, cf, wl) in self._series if wi <= _w and cf == base_cfg]
-                if len(jcand) < need or len(jbase) < self._min_samples:
+                if len(jcand) < max(need, self._min_samples) or len(jbase) < self._min_samples:
                     continue
                 if accept_decision(jbase, jcand, alpha=self._alpha,
                                    effect_floor=self._effect_floor) != "accept":
@@ -1386,7 +1386,7 @@ class CoordinateBanditPlanner(StepVerifyMixin):
                     reason="the moved arm's p90 step wall accepts against the arm it left")
                 self._move_from.pop(short, None)
                 continue
-            if len(cand) < need or len(base) < self._min_samples:
+            if len(cand) < max(need, self._min_samples) or len(base) < self._min_samples:
                 continue
             if accept_decision(base, cand, alpha=self._alpha,
                                effect_floor=self._effect_floor) != "accept":
@@ -1594,6 +1594,10 @@ class CoordinateBanditPlanner(StepVerifyMixin):
                 ex, src = got
                 return (ex, "domain_exposed:%s" % src) if ex > 0.0 else (None, "no_exposed_time")
         if self._rate_mode and self._epoch_windows < self._min_samples:
+            got = self._sv_early_effect(short)
+            if got is not None:
+                ex, src = got
+                return ex, "domain_exposed:%s" % src
             return None, "insufficient_samples:%d<%d" % (self._epoch_windows, self._min_samples)
         ex = self._epoch_domain_exposed(own)
         if ex is None or ex <= 0.0:

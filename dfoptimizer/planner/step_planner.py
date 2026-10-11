@@ -93,7 +93,11 @@ class StepVerifyMixin:
         dom = self._domain.get(short)
         have = (ss or self._tl[-1]).series if (ss is not None or self._tl) else {}
         if dom == "input":
-            return "job_input" if "job_input" in have else ("storage" if "storage" in have else None)
+            return next((key for key in ("job_input", "input", "storage") if key in have), None)
+        if dom == "decode":
+            # A decode worker pool can expose only a combined parent fetch wait.
+            # Keep that measurement labelled input; never call it pure decode.
+            return next((key for key in ("decode", "input") if key in have), None)
         return dom if dom in have else None
 
     def _sv_segment(self, key: str, lo_excl: float, hi_incl: float):
@@ -129,12 +133,42 @@ class StepVerifyMixin:
         if key is None:
             return None
         x, w = self._sv_segment(key, self._sv_current_segment_start(), float("inf"))
-        if len(x) < 2:
+        if len(x) < max(self._min_samples, 2 * sv.block_length(x)[0]):
             return None
         lb = sv.mean_lower_bound(x, w)
         if lb is None or lb <= 0.0:
             return 0.0, "no_exposed_time"
         return lb, "step_exposure:%s" % key
+
+    def _sv_early_effect(self, short: str) -> Optional[Tuple[float, str]]:
+        """Admit a measured domain price from one clean steady window.
+
+        When no targeted step series exists, its native window exposure is still
+        measured. Use it only if the 95% block-bootstrap interval of the mean
+        wall time has half-width smaller than that price, with at least two
+        blocks and the existing minimum observations. This tests precision of
+        the gain's wall-time yardstick, not an exposure-specific mechanism CI.
+        The ordinary horizon and apply-cost gates still price the move.
+        """
+        if not self._sv_active() or not self._tl or self._epoch_windows < 1:
+            return None
+        ss = self._tl[-1]
+        if (self._win_metrics.get("planner_history_ready") != 1
+                or ss.first <= max(WARMUP_STEPS, self._sv_current_segment_start())):
+            return None
+        own = self._domain.get(short)
+        prices = self._epoch_dom.get(own) or ()
+        if not prices or prices[-1] is None or prices[-1] <= 0.0:
+            return None
+        wall = ss.series["wall"]
+        L = sv.block_length(wall)[0]
+        if len(wall) < max(self._min_samples, 2 * L):
+            return None
+        means = sv.mbb_means(wall, ss.weights, L, np.random.default_rng(sv.SEED))
+        lo, hi = np.quantile(means, [(1 - sv.CONFIDENCE) / 2, (1 + sv.CONFIDENCE) / 2])
+        if (hi - lo) / 2 >= float(prices[-1]):
+            return None
+        return float(prices[-1]), "steady_window_exposure:%s:wall_precision95" % own
 
     def _sv_required_steps(self, short: str, delta: float, remaining: Optional[float]) -> Optional[Tuple[int, dict]]:
         """Steps a verdict on an effect of `delta` s/step needs, and whether the horizon holds them.
@@ -163,7 +197,12 @@ class StepVerifyMixin:
     # ------------------------------------------------------------------ verification
     def _sv_verdict(self, short: str, old_value, cur, change_step: int, window: int,
                     delta: Optional[float] = None) -> Optional[str]:
-        """'confirm' | 'revert' | 'collect' for an applied move, or None when per-step data cannot judge it.
+        """'confirm' | 'revert' | 'collect', or None when no per-step timeline exists.
+
+        Missing target exposure never blocks a wall-time bootstrap verdict.
+        Exposure-specific futility/refutation requires actual target samples;
+        missing or too few wall samples collect rather than falling back to
+        an under-sampled window test.
 
         confirm   the step-time interval excludes zero on the improving side
         revert    the step-time interval excludes zero on the worsening side; or the targeted exposure itself rose
@@ -176,17 +215,15 @@ class StepVerifyMixin:
         if not self._sv_enabled():
             return None
         key = self._sv_key(short)
-        if key is None:
-            return None
         bounds = self._sv_boundaries()
         prev = max([b for b in bounds if b < change_step], default=0)
         nxt = min([b for b in bounds if b > change_step], default=float("inf"))
         wall_pre, w_pre = self._sv_segment("wall", prev, change_step)
         wall_post, w_post = self._sv_segment("wall", change_step, nxt)
         if len(wall_pre) < 1 or len(wall_post) < 1:
-            return None
-        exp_pre, wx_pre = self._sv_segment(key, prev, change_step)
-        exp_post, wx_post = self._sv_segment(key, change_step, nxt)
+            return "collect"
+        exp_pre, wx_pre = self._sv_segment(key, prev, change_step) if key else (np.array([]), np.array([]))
+        exp_post, wx_post = self._sv_segment(key, change_step, nxt) if key else (np.array([]), np.array([]))
         wall_ci = sv.diff_ci(wall_pre, wall_post, w_pre, w_post)
         exp_ci = sv.diff_ci(exp_pre, exp_post, wx_pre, wx_post) if len(exp_pre) and len(exp_post) else None
         verdict = sv.verdict(wall_ci, self._min_samples)
