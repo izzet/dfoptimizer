@@ -807,6 +807,10 @@ class CoordinateBanditPlanner(StepVerifyMixin):
 
     def _finalize_window(self, window: int) -> Optional[dict]:
         m = self._win_metrics
+        if (m.get("lf_v1_valid") == 0.0
+                or m.get("lf_v1_trace_complete") == 0.0):
+            logger.info("optimizer.liveflow_v1.invalid_window", window=window)
+            return None
         # The per-step series and node telemetry are evidence about the steps themselves, whether or
         # not this window can be credited to a configuration (an apply window is not, but its steps
         # after the apply boundary are post-apply steps).
